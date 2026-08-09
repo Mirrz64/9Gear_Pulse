@@ -1,0 +1,54 @@
+erDiagram
+    PROJECTS ||--o{ PIPELINES : contains
+    CONNECTION_PROFILES ||--o{ PIPELINES : "source of"
+    CONNECTION_PROFILES ||--o{ PIPELINES : "destination of"
+    PIPELINES ||--o{ PIPELINE_RUNS : "executed as"
+    PIPELINES ||--o| SCHEDULES : "scheduled by"
+    PIPELINES ||--o{ AUDIT_LOG : logs
+
+    PROJECTS {
+        uuid id PK
+        uuid owner_id FK
+        text name
+        text goal_description
+        text status
+    }
+    CONNECTION_PROFILES {
+        uuid id PK
+        uuid owner_id FK
+        text type
+        bytea encrypted_credentials
+        jsonb schema_metadata_json
+        timestamptz last_introspected_at
+    }
+    PIPELINES {
+        uuid id PK
+        uuid project_id FK
+        uuid source_connection_id FK
+        uuid destination_connection_id FK
+        text generated_code
+        int version
+        text status
+    }
+    PIPELINE_RUNS {
+        uuid id PK
+        uuid pipeline_id FK
+        timestamptz started_at
+        timestamptz finished_at
+        text status
+        int row_count
+    }
+    SCHEDULES {
+        uuid id PK
+        uuid pipeline_id FK
+        text cron_expression
+        timestamptz next_run_at
+    }
+    AUDIT_LOG {
+        uuid id PK
+        uuid actor_id FK
+        text action
+        text entity_type
+        uuid entity_id
+        timestamptz timestamp
+    }
