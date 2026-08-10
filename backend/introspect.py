@@ -13,13 +13,13 @@ import psycopg2
 from psycopg2 import sql
 from psycopg2.extras import RealDictCursor
 
-load_dotenv()
+load_dotenv(override=True)  # Load .env file, but allow real env vars to override
 
 
 def get_connection():
     return psycopg2.connect(
         host=os.environ["PG_HOST"],
-        port=os.environ.get("PG_PORT", 5432),
+        port=int(os.environ.get("PG_PORT", 5433)),
         dbname=os.environ["PG_DATABASE"],
         user=os.environ["PG_USER"],
         password=os.environ["PG_PASSWORD"],

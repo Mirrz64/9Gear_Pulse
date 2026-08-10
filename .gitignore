@@ -144,3 +144,13 @@ vite.config.ts.timestamp-*
 
 # Virtual Environment
 venv
+
+# Generated artifacts & local pipelines
+generated_pipeline.py
+backend/generated_pipeline.py
+.dlt/
+backend/.dlt/
+__pycache__/
+backend/__pycache__/
+.env
+backend/.env

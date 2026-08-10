@@ -2,30 +2,34 @@
 Phase 1: natural-language goal + schema metadata -> generated pipeline code.
 
 The AI receives only the schema summary produced by introspect.py and the
-user's plain-English goal. It never sees, and is explicitly told not to
+user's plain-English goal[cite: 1]. It never sees, and is explicitly told not to
 invent, connection credentials — those are injected at run time by whatever
-executes the generated script, not by the AI.
+executes the generated script, not by the AI[cite: 1, 3].
 """
 import os
 import json
+import re
 from dotenv import load_dotenv
 import anthropic
 
-load_dotenv()
+load_dotenv(override=True)
+
+if "ANTHROPIC_API_KEY" not in os.environ:
+    raise ValueError("Missing ANTHROPIC_API_KEY in environment variables or .env file.")
 
 client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 SYSTEM_PROMPT = """You are a data pipeline generator. Given a database schema \
 summary and a plain-English goal, generate a Python ETL script using the \
-`dlt` library (https://dlthub.com) that accomplishes the goal.
+`dlt` library (https://dlthub.com) that accomplishes the goal[cite: 1, 3].
 
 Connection details (host, user, password, etc.) will be injected as \
-environment variables at run time by the calling system. Never invent, \
+environment variables at run time by the calling system[cite: 1, 3]. Never invent, \
 guess, or reference specific credential values — read them from os.environ \
-using generic names like SOURCE_DB_URL / DEST_DB_URL.
+using generic names like SOURCE_DB_URL / DEST_DB_URL[cite: 1, 3].
 
 Return ONLY valid JSON matching this exact shape, no other text, no \
-markdown fences:
+markdown fences[cite: 1]:
 
 {
   "pipeline_name": "string",
@@ -36,18 +40,43 @@ markdown fences:
 """
 
 
+def clean_json_response(raw_text: str) -> str:
+    """Strips Markdown code fences and extracts raw JSON content[cite: 1]."""
+    text = raw_text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\n?", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\n?```$", "", text)
+    return text.strip()
+
+
 def generate_pipeline(schema_summary: dict, goal: str) -> dict:
     user_content = json.dumps({"schema_summary": schema_summary, "goal": goal})
+    raw_text = ""
 
-    response = client.messages.create(
-        model="claude-sonnet-5",  # check console.anthropic.com for the current default
-        max_tokens=4000,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_content}],
-    )
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-5",
+            max_tokens=4000,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_content}],
+        )
 
-    raw_text = response.content[0].text
-    return json.loads(raw_text)
+        # Filter content blocks to extract text and ignore ThinkingBlock objects
+        text_blocks = [
+            block.text for block in response.content 
+            if getattr(block, "type", None) == "text" or hasattr(block, "text")
+        ]
+        if not text_blocks:
+            raise ValueError("No text content block found in model response.")
+
+        raw_text = text_blocks[0]
+        cleaned_text = clean_json_response(raw_text)
+        return json.loads(cleaned_text)
+
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse model response as JSON: {e}\nRaw output:\n{raw_text}")
+    except anthropic.APIError as e:
+        raise RuntimeError(f"Anthropic API call failed: {e}")
 
 
 if __name__ == "__main__":
@@ -61,14 +90,16 @@ if __name__ == "__main__":
 
     result = generate_pipeline(schema, goal)
 
-    print(f"--- {result['pipeline_name']} ---")
-    print(result["description"])
+    print(f"--- {result.get('pipeline_name', 'Generated Pipeline')} ---")
+    print(result.get("description", "No description provided."))
+    
     if result.get("assumptions"):
         print("\nAssumptions made:")
         for a in result["assumptions"]:
             print(f"  - {a}")
 
     out_path = "generated_pipeline.py"
-    with open(out_path, "w") as f:
+    with open(out_path, "w", encoding="utf-8") as f:
         f.write(result["code"])
+        
     print(f"\nSaved to {out_path} — review before running against real data.")
