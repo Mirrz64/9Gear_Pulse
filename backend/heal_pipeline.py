@@ -7,13 +7,17 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
+if "ANTHROPIC_API_KEY" not in os.environ:
+    raise ValueError("Missing ANTHROPIC_API_KEY in environment variables or .env file.")
+
 client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 HEALER_SYSTEM_PROMPT = """You are an expert Python data engineering agent specializing in `dlt` and database pipelines.
-You are given a broken Python ETL script and the runtime error/traceback produced when executing it inside a Docker container.
+You are given a broken Python ETL script, schema metadata of the source database, and the runtime error/traceback produced when executing it inside a Docker container.
 
 Your job is to fix the code so that it executes without errors.
 - Preserve the overall pipeline logic and business goal.
+- Use actual existing tables and columns defined in the schema summary.
 - Do NOT invent database credentials; keep reading from environment variables (SOURCE_DB_URL, DEST_DB_URL).
 - Return ONLY valid JSON matching this exact structure with no extra text or explanations:
 
@@ -46,7 +50,7 @@ def run_in_sandbox(script_path: str) -> tuple[bool, str]:
     }
 
     setup_and_run_cmd = (
-        '/bin/bash -c "pip install --quiet --disable-pip-version-check '
+        '/bin/bash -c "pip install --quiet --disable-pip-version-check --no-warn-script-location '
         'dlt psycopg2-binary sqlalchemy && python /app/pipeline.py"'
     )
 
@@ -69,11 +73,12 @@ def run_in_sandbox(script_path: str) -> tuple[bool, str]:
         return (False, f"Sandbox runtime container exception: {str(e)}")
 
 
-def heal_script(broken_code: str, error_log: str) -> str:
-    """Passes broken code and execution error traceback to Claude for repair."""
+def heal_script(broken_code: str, error_log: str, schema_summary: dict = None) -> str:
+    """Passes broken code, schema context, and execution error traceback to Claude for repair."""
     user_prompt = json.dumps({
         "broken_code": broken_code,
-        "error_traceback": error_log
+        "error_traceback": error_log,
+        "schema_summary": schema_summary or {}
     })
 
     response = client.messages.create(
@@ -87,7 +92,9 @@ def heal_script(broken_code: str, error_log: str) -> str:
         block.text for block in response.content 
         if getattr(block, "type", None) == "text" or hasattr(block, "text")
     ]
-    
+    if not text_blocks:
+        raise ValueError("No text content block found in model response.")
+
     cleaned = clean_json_response(text_blocks[0])
     parsed = json.loads(cleaned)
     
@@ -97,16 +104,28 @@ def heal_script(broken_code: str, error_log: str) -> str:
     return parsed["fixed_code"]
 
 
-def execute_with_self_healing(script_path: str, max_retries: int = 3):
-    """Executes a pipeline script in the sandbox and attempts auto-repair on failure up to max_retries."""
+def execute_with_self_healing(
+    script_path: str, 
+    schema_summary: dict = None, 
+    max_retries: int = 3
+) -> tuple[bool, int, str]:
+    """Executes a pipeline script in the sandbox and attempts auto-repair on failure up to max_retries.
+    Returns: (success: bool, total_attempts: int, execution_logs: str)
+    """
+    if schema_summary is None:
+        from introspect import introspect_schema
+        schema_summary = introspect_schema()
+
+    last_logs = ""
     for attempt in range(1, max_retries + 1):
         print(f"--- Sandbox Run (Attempt {attempt}/{max_retries}) ---")
         success, logs = run_in_sandbox(script_path)
+        last_logs = logs
 
         if success:
             print("\nPipeline execution succeeded!")
             print(logs)
-            return True
+            return True, attempt, logs
 
         print(f"\nExecution failed on attempt {attempt}.")
         print("--- Execution Error Traceback ---")
@@ -117,14 +136,16 @@ def execute_with_self_healing(script_path: str, max_retries: int = 3):
             with open(script_path, "r", encoding="utf-8") as f:
                 broken_code = f.read()
 
-            fixed_code = heal_script(broken_code, logs)
+            fixed_code = heal_script(broken_code, logs, schema_summary)
 
             with open(script_path, "w", encoding="utf-8") as f:
                 f.write(fixed_code)
             print(f"Updated {script_path} with auto-healed code. Retrying execution...\n")
         else:
             print("\nReached maximum retry threshold. Self-healing unsuccessful.")
-            return False
+            return False, attempt, last_logs
+
+    return False, max_retries, last_logs
 
 
 if __name__ == "__main__":

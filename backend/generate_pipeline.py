@@ -21,15 +21,19 @@ client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 SYSTEM_PROMPT = """You are a data pipeline generator. Given a database schema \
 summary and a plain-English goal, generate a Python ETL script using the \
-`dlt` library (https://dlthub.com) that accomplishes the goal[cite: 1, 3].
+`dlt` library (https://dlthub.com) that accomplishes the goal.
 
 Connection details (host, user, password, etc.) will be injected as \
-environment variables at run time by the calling system[cite: 1, 3]. Never invent, \
+environment variables at run time by the calling system. Never invent, \
 guess, or reference specific credential values — read them from os.environ \
-using generic names like SOURCE_DB_URL / DEST_DB_URL[cite: 1, 3].
+using generic names like SOURCE_DB_URL / DEST_DB_URL.
+
+Schema Drift Requirements:
+- Configure schema contracts explicitly on the pipeline or resources to handle schema evolution cleanly.
+- Ensure new columns or structural variations are safely evolved without throwing runtime schema exceptions (e.g., using schema_contract={"tables": "evolve", "columns": "evolve"}).
 
 Return ONLY valid JSON matching this exact shape, no other text, no \
-markdown fences[cite: 1]:
+markdown fences:
 
 {
   "pipeline_name": "string",
