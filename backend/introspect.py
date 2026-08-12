@@ -8,6 +8,8 @@ connection credentials never leave this script.
 """
 import os
 import json
+import datetime
+import re
 from dotenv import load_dotenv
 import psycopg2
 from psycopg2 import sql
@@ -15,6 +17,13 @@ from psycopg2.extras import RealDictCursor
 
 load_dotenv(override=True)  # Load .env file, but allow real env vars to override
 
+def json_serial(obj):
+    """JSON serializer for objects not serializable by default json code"""
+    if isinstance(obj, (datetime.datetime, datetime.date)):
+        return obj.isoformat()
+    return str(obj)
+
+# Use json_serial when encoding sample rows or metadata dictionaries
 
 def get_connection():
     return psycopg2.connect(

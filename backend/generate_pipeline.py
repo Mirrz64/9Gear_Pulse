@@ -2,9 +2,9 @@
 Phase 1: natural-language goal + schema metadata -> generated pipeline code.
 
 The AI receives only the schema summary produced by introspect.py and the
-user's plain-English goal[cite: 1]. It never sees, and is explicitly told not to
+user's plain-English goal. It never sees, and is explicitly told not to
 invent, connection credentials — those are injected at run time by whatever
-executes the generated script, not by the AI[cite: 1, 3].
+executes the generated script, not by the AI.
 """
 import os
 import json
@@ -45,7 +45,7 @@ markdown fences:
 
 
 def clean_json_response(raw_text: str) -> str:
-    """Strips Markdown code fences and extracts raw JSON content[cite: 1]."""
+    """Strips Markdown code fences and extracts raw JSON content."""
     text = raw_text.strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\n?", "", text, flags=re.IGNORECASE)
@@ -54,7 +54,8 @@ def clean_json_response(raw_text: str) -> str:
 
 
 def generate_pipeline(schema_summary: dict, goal: str) -> dict:
-    user_content = json.dumps({"schema_summary": schema_summary, "goal": goal})
+    # default=str converts datetime/date objects into standard strings during serialization
+    user_content = json.dumps({"schema_summary": schema_summary, "goal": goal}, default=str)
     raw_text = ""
 
     try:

@@ -1,7 +1,7 @@
 'use client';
 
-import React, { useState, useEffect, Fragment } from 'react';
-import { Play, Database, Activity, RefreshCw, CheckCircle, AlertCircle, ChevronDown, ChevronUp, Terminal, Table, X, Code, Eye, EyeOff } from 'lucide-react';
+import React, { useState, useEffect, useRef, Fragment } from 'react';
+import { Play, Database, Activity, RefreshCw, CheckCircle, AlertCircle, ChevronDown, ChevronUp, Terminal, Table, X, Code, Eye, EyeOff, PlusCircle } from 'lucide-react';
 
 interface AuditLog {
   id: number;
@@ -30,6 +30,8 @@ export default function Dashboard() {
   const [expandedLogId, setExpandedLogId] = useState<number | null>(null);
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
   const [hideDltTables, setHideDltTables] = useState(true);
+
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const fetchLogs = async () => {
     try {
@@ -104,6 +106,26 @@ export default function Dashboard() {
     }
   };
 
+  const insertMetadataIntoGoal = (textToInsert: string) => {
+    if (!textareaRef.current) {
+      setGoal((prev) => (prev ? `${prev} ${textToInsert}` : textToInsert));
+      return;
+    }
+
+    const start = textareaRef.current.selectionStart;
+    const end = textareaRef.current.selectionEnd;
+    const updatedGoal = goal.substring(0, start) + textToInsert + goal.substring(end);
+
+    setGoal(updatedGoal);
+
+    setTimeout(() => {
+      if (textareaRef.current) {
+        textareaRef.current.focus();
+        textareaRef.current.setSelectionRange(start + textToInsert.length, start + textToInsert.length);
+      }
+    }, 0);
+  };
+
   const toggleExpand = (id: number) => {
     setExpandedLogId(expandedLogId === id ? null : id);
   };
@@ -145,7 +167,7 @@ export default function Dashboard() {
           </div>
         </header>
 
-        {/* Pipeline Input Card */}
+        {/* Input Card */}
         <section className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-xl">
           <h2 className="text-lg font-semibold mb-3 flex items-center gap-2">
             <Database className="h-5 w-5 text-blue-400" />
@@ -153,6 +175,7 @@ export default function Dashboard() {
           </h2>
           <form onSubmit={handleRunPipeline} className="space-y-4">
             <textarea
+              ref={textareaRef}
               value={goal}
               onChange={(e) => setGoal(e.target.value)}
               placeholder="e.g. Extract all records from users table, append dynamic attributes, and load into analytics_reporting with auto schema evolution"
@@ -293,8 +316,8 @@ export default function Dashboard() {
               <button
                 onClick={() => setHideDltTables(!hideDltTables)}
                 className={`p-1.5 rounded-md border transition ${hideDltTables
-                    ? 'bg-blue-950 border-blue-800 text-blue-400'
-                    : 'bg-slate-900 border-slate-800 text-slate-500'
+                  ? 'bg-blue-950 border-blue-800 text-blue-400'
+                  : 'bg-slate-900 border-slate-800 text-slate-500'
                   }`}
                 title={hideDltTables ? "Showing Business Tables Only" : "Showing All System Tables"}
               >
@@ -308,14 +331,29 @@ export default function Dashboard() {
               ) : (
                 filteredSchema.map(([tableName, columns]) => (
                   <div key={tableName} className="bg-slate-950 border border-slate-800 rounded-lg p-4 space-y-3">
-                    <div className="font-mono text-sm font-semibold text-blue-400 border-b border-slate-800/60 pb-2">
-                      {tableName}
+                    <div className="flex items-center justify-between border-b border-slate-800/60 pb-2">
+                      <span className="font-mono text-sm font-semibold text-blue-400">
+                        {tableName}
+                      </span>
+                      <button
+                        onClick={() => insertMetadataIntoGoal(tableName)}
+                        className="flex items-center gap-1 text-[11px] text-slate-400 hover:text-blue-400 transition"
+                        title="Insert table name into prompt"
+                      >
+                        <PlusCircle className="h-3.5 w-3.5" />
+                        Insert
+                      </button>
                     </div>
                     <ul className="space-y-1.5 text-xs font-mono text-slate-300">
                       {columns.map((col, idx) => (
-                        <li key={idx} className="flex justify-between items-center">
-                          <span>{col.column_name}</span>
-                          <span className="text-slate-500 text-[10px] bg-slate-900 px-2 py-0.5 rounded border border-slate-800">
+                        <li
+                          key={idx}
+                          onClick={() => insertMetadataIntoGoal(col.column_name)}
+                          className="flex justify-between items-center p-1 rounded hover:bg-slate-900 cursor-pointer transition group"
+                          title="Click to insert column into prompt"
+                        >
+                          <span className="group-hover:text-blue-300">{col.column_name}</span>
+                          <span className="text-slate-500 text-[10px] bg-slate-900 group-hover:bg-slate-800 px-2 py-0.5 rounded border border-slate-800">
                             {col.data_type}
                           </span>
                         </li>
