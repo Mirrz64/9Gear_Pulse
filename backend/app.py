@@ -146,3 +146,13 @@ def get_execution_logs():
             return {"logs": logs}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to query audit logs: {str(e)}")
+
+@app.delete("/api/schedule/{job_id}")
+def delete_schedule(job_id: str):
+    """Cancels and removes an active scheduled background job."""
+    job = scheduler.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Scheduled job not found")
+    
+    scheduler.remove_job(job_id)
+    return {"status": "DELETED", "job_id": job_id}

@@ -1,7 +1,11 @@
 'use client';
 
 import React, { useState, useEffect, useRef, Fragment } from 'react';
-import { Play, Database, Activity, RefreshCw, CheckCircle, AlertCircle, ChevronDown, ChevronUp, Terminal, Table, X, Code, Eye, EyeOff, PlusCircle } from 'lucide-react';
+import {
+  Play, Database, Activity, RefreshCw, CheckCircle, AlertCircle,
+  ChevronDown, ChevronUp, Terminal, Table, X, Code, Eye, EyeOff,
+  PlusCircle, Search, Clock, Copy, Download, Calendar, Check, Trash2
+} from 'lucide-react';
 
 interface AuditLog {
   id: number;
@@ -19,6 +23,12 @@ interface ColumnSchema {
 
 type SchemaMap = Record<string, ColumnSchema[]>;
 
+interface ScheduleJob {
+  id: string;
+  next_run_time: string;
+  trigger: string;
+}
+
 export default function Dashboard() {
   const [goal, setGoal] = useState('');
   const [loading, setLoading] = useState(false);
@@ -28,8 +38,27 @@ export default function Dashboard() {
   const [activeTab, setActiveTab] = useState<'logs' | 'code'>('logs');
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [expandedLogId, setExpandedLogId] = useState<number | null>(null);
-  const [isDrawerOpen, setIsDrawerOpen] = useState(false);
+
+  // Side Drawers
+  const [isSchemaDrawerOpen, setIsSchemaDrawerOpen] = useState(false);
+  const [isScheduleDrawerOpen, setIsScheduleDrawerOpen] = useState(false);
+
+  // Schema Search & Filtering
+  const [schemaSearch, setSchemaSearch] = useState('');
   const [hideDltTables, setHideDltTables] = useState(true);
+
+  // Log Search & Filtering
+  const [searchQuery, setSearchQuery] = useState('');
+  const [statusFilter, setStatusFilter] = useState<'ALL' | 'SUCCESS' | 'FAILED'>('ALL');
+
+  // Scheduling State
+  const [scheduleGoal, setScheduleGoal] = useState('');
+  const [intervalMinutes, setIntervalMinutes] = useState<number>(30);
+  const [schedules, setSchedules] = useState<ScheduleJob[]>([]);
+  const [scheduleStatus, setScheduleStatus] = useState<string | null>(null);
+
+  // Copy Feedback State
+  const [copiedType, setCopiedType] = useState<'code' | 'logs' | null>(null);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -69,10 +98,23 @@ export default function Dashboard() {
     }
   };
 
+  const fetchSchedules = async () => {
+    try {
+      const res = await fetch('http://127.0.0.1:8000/api/schedules');
+      if (res.ok) {
+        const data = await res.json();
+        setSchedules(data.schedules || []);
+      }
+    } catch (err) {
+      console.error('Failed to fetch schedules:', err);
+    }
+  };
+
   useEffect(() => {
     fetchLogs();
     fetchSchema();
     fetchCode();
+    fetchSchedules();
   }, []);
 
   const handleRunPipeline = async (e: React.FormEvent) => {
@@ -106,6 +148,48 @@ export default function Dashboard() {
     }
   };
 
+  const handleSchedulePipeline = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!scheduleGoal.trim()) return;
+
+    setScheduleStatus('Scheduling job...');
+    try {
+      const res = await fetch('http://127.0.0.1:8000/api/schedule', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          goal: scheduleGoal,
+          interval_minutes: Number(intervalMinutes),
+          max_retries: 3,
+        }),
+      });
+
+      if (res.ok) {
+        setScheduleStatus('Pipeline scheduled successfully!');
+        setScheduleGoal('');
+        fetchSchedules();
+      } else {
+        const err = await res.json();
+        setScheduleStatus(`Scheduling failed: ${err.detail || 'Unknown error'}`);
+      }
+    } catch (err) {
+      setScheduleStatus('Failed to connect to backend.');
+    }
+  };
+
+  const handleDeleteSchedule = async (jobId: string) => {
+    try {
+      const res = await fetch(`http://127.0.0.1:8000/api/schedule/${jobId}`, {
+        method: 'DELETE',
+      });
+      if (res.ok) {
+        fetchSchedules();
+      }
+    } catch (err) {
+      console.error('Failed to delete schedule:', err);
+    }
+  };
+
   const insertMetadataIntoGoal = (textToInsert: string) => {
     if (!textareaRef.current) {
       setGoal((prev) => (prev ? `${prev} ${textToInsert}` : textToInsert));
@@ -126,15 +210,46 @@ export default function Dashboard() {
     }, 0);
   };
 
+  const copyToClipboard = (text: string, type: 'code' | 'logs') => {
+    navigator.clipboard.writeText(text);
+    setCopiedType(type);
+    setTimeout(() => setCopiedType(null), 2000);
+  };
+
+  const downloadArtifact = (content: string, filename: string) => {
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
   const toggleExpand = (id: number) => {
     setExpandedLogId(expandedLogId === id ? null : id);
   };
 
+  // Log Filtering Logic
+  const filteredLogs = logs.filter((log) => {
+    const matchesSearch =
+      log.pipeline_name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      log.id.toString().includes(searchQuery);
+
+    const matchesStatus =
+      statusFilter === 'ALL' || log.status.toUpperCase() === statusFilter;
+
+    return matchesSearch && matchesStatus;
+  });
+
+  // Schema Search & System Table Filtering Logic
   const filteredSchema = Object.entries(schema).filter(([tableName]) => {
-    if (hideDltTables) {
-      return !tableName.includes('_dlt_') && !tableName.startsWith('_pipeline_audit');
+    if (hideDltTables && (tableName.includes('_dlt_') || tableName.startsWith('_pipeline_audit'))) {
+      return false;
     }
-    return true;
+    return tableName.toLowerCase().includes(schemaSearch.toLowerCase());
   });
 
   return (
@@ -151,14 +266,21 @@ export default function Dashboard() {
           </div>
           <div className="flex items-center space-x-3">
             <button
-              onClick={() => setIsDrawerOpen(true)}
+              onClick={() => setIsScheduleDrawerOpen(true)}
+              className="flex items-center gap-2 bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 px-3 py-2 rounded-lg text-sm transition"
+            >
+              <Calendar className="h-4 w-4 text-emerald-400" />
+              Schedules ({schedules.length})
+            </button>
+            <button
+              onClick={() => setIsSchemaDrawerOpen(true)}
               className="flex items-center gap-2 bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 px-3 py-2 rounded-lg text-sm transition"
             >
               <Table className="h-4 w-4 text-blue-400" />
-              View Database Schema
+              View Schema
             </button>
             <button
-              onClick={() => { fetchLogs(); fetchCode(); }}
+              onClick={() => { fetchLogs(); fetchCode(); fetchSchedules(); }}
               className="p-2 text-slate-400 hover:text-slate-100 hover:bg-slate-900 rounded-lg transition"
               title="Refresh Audit Logs"
             >
@@ -200,9 +322,40 @@ export default function Dashboard() {
           </form>
         </section>
 
-        {/* Execution Audit Table */}
-        <section className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-xl">
-          <h2 className="text-lg font-semibold mb-4">Execution Audit Logs</h2>
+        {/* Execution Audit Table Section */}
+        <section className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-xl space-y-4">
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+            <h2 className="text-lg font-semibold">Execution Audit Logs</h2>
+
+            {/* Search and Filters */}
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="relative">
+                <Search className="h-4 w-4 text-slate-500 absolute left-3 top-2.5" />
+                <input
+                  type="text"
+                  placeholder="Search by name or ID..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="bg-slate-950 border border-slate-800 rounded-lg pl-9 pr-3 py-1.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-blue-500 transition w-48"
+                />
+              </div>
+              <div className="flex items-center bg-slate-950 border border-slate-800 rounded-lg p-1">
+                {(['ALL', 'SUCCESS', 'FAILED'] as const).map((status) => (
+                  <button
+                    key={status}
+                    onClick={() => setStatusFilter(status)}
+                    className={`px-3 py-1 rounded-md text-xs font-semibold transition ${statusFilter === status
+                        ? 'bg-blue-600 text-white'
+                        : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                  >
+                    {status}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
           <div className="overflow-x-auto">
             <table className="w-full text-left text-sm text-slate-400">
               <thead className="bg-slate-950 text-slate-300 uppercase text-xs border-b border-slate-800">
@@ -216,14 +369,14 @@ export default function Dashboard() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800">
-                {logs.length === 0 ? (
+                {filteredLogs.length === 0 ? (
                   <tr>
                     <td colSpan={6} className="p-4 text-center text-slate-500">
-                      No audit records found. Trigger a pipeline to begin logging.
+                      No matching audit records found.
                     </td>
                   </tr>
                 ) : (
-                  logs.map((log) => (
+                  filteredLogs.map((log) => (
                     <Fragment key={log.id}>
                       <tr
                         onClick={() => toggleExpand(log.id)}
@@ -250,24 +403,52 @@ export default function Dashboard() {
                         <tr className="bg-slate-950/80 border-b border-slate-800">
                           <td colSpan={6} className="p-4">
                             <div className="space-y-3">
-                              {/* Tab Controls */}
-                              <div className="flex items-center gap-2 border-b border-slate-800 pb-2">
-                                <button
-                                  onClick={() => setActiveTab('logs')}
-                                  className={`flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-md transition ${activeTab === 'logs' ? 'bg-blue-950 border border-blue-800 text-blue-400' : 'text-slate-400 hover:text-slate-200'
-                                    }`}
-                                >
-                                  <Terminal className="h-3.5 w-3.5" />
-                                  Terminal Logs
-                                </button>
-                                <button
-                                  onClick={() => setActiveTab('code')}
-                                  className={`flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-md transition ${activeTab === 'code' ? 'bg-blue-950 border border-blue-800 text-blue-400' : 'text-slate-400 hover:text-slate-200'
-                                    }`}
-                                >
-                                  <Code className="h-3.5 w-3.5" />
-                                  Generated Python Code
-                                </button>
+                              {/* Header & Export Controls */}
+                              <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+                                <div className="flex items-center gap-2">
+                                  <button
+                                    onClick={() => setActiveTab('logs')}
+                                    className={`flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-md transition ${activeTab === 'logs' ? 'bg-blue-950 border border-blue-800 text-blue-400' : 'text-slate-400 hover:text-slate-200'
+                                      }`}
+                                  >
+                                    <Terminal className="h-3.5 w-3.5" />
+                                    Terminal Logs
+                                  </button>
+                                  <button
+                                    onClick={() => setActiveTab('code')}
+                                    className={`flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-md transition ${activeTab === 'code' ? 'bg-blue-950 border border-blue-800 text-blue-400' : 'text-slate-400 hover:text-slate-200'
+                                      }`}
+                                  >
+                                    <Code className="h-3.5 w-3.5" />
+                                    Generated Python Code
+                                  </button>
+                                </div>
+
+                                {/* Export Controls */}
+                                <div className="flex items-center gap-2">
+                                  <button
+                                    onClick={() => copyToClipboard(
+                                      activeTab === 'logs' ? (log.logs || '') : generatedCode,
+                                      activeTab
+                                    )}
+                                    className="flex items-center gap-1 text-xs bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 px-2.5 py-1 rounded transition"
+                                    title="Copy content to clipboard"
+                                  >
+                                    {copiedType === activeTab ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : <Copy className="h-3.5 w-3.5" />}
+                                    {copiedType === activeTab ? 'Copied!' : 'Copy'}
+                                  </button>
+                                  <button
+                                    onClick={() => downloadArtifact(
+                                      activeTab === 'logs' ? (log.logs || '') : generatedCode,
+                                      activeTab === 'logs' ? `execution_log_${log.id}.log` : `${log.pipeline_name}.py`
+                                    )}
+                                    className="flex items-center gap-1 text-xs bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 px-2.5 py-1 rounded transition"
+                                    title="Download artifact file"
+                                  >
+                                    <Download className="h-3.5 w-3.5 text-blue-400" />
+                                    Download
+                                  </button>
+                                </div>
                               </div>
 
                               {/* Tab Contents */}
@@ -293,8 +474,94 @@ export default function Dashboard() {
         </section>
       </div>
 
-      {/* Schema Side Drawer */}
-      {isDrawerOpen && (
+      {/* Pipeline Scheduling Drawer */}
+      {isScheduleDrawerOpen && (
+        <div className="fixed inset-0 z-50 flex justify-end bg-slate-950/60 backdrop-blur-sm">
+          <div className="w-full max-w-md bg-slate-900 border-l border-slate-800 h-full p-6 shadow-2xl flex flex-col space-y-6">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-4">
+              <div className="flex items-center gap-2">
+                <Calendar className="h-5 w-5 text-emerald-400" />
+                <h3 className="text-lg font-semibold text-slate-100">Automated Pipeline Scheduler</h3>
+              </div>
+              <button
+                onClick={() => setIsScheduleDrawerOpen(false)}
+                className="p-1 text-slate-400 hover:text-slate-100 hover:bg-slate-800 rounded transition"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            {/* Schedule New Job Form */}
+            <form onSubmit={handleSchedulePipeline} className="space-y-4 bg-slate-950 p-4 rounded-xl border border-slate-800">
+              <h4 className="text-xs uppercase tracking-wider font-semibold text-slate-400">Schedule Recurring Pipeline</h4>
+              <div>
+                <label className="block text-xs text-slate-400 mb-1">Goal Prompt</label>
+                <textarea
+                  value={scheduleGoal}
+                  onChange={(e) => setScheduleGoal(e.target.value)}
+                  placeholder="e.g. Sync users table to analytics_reporting.users_snapshot every 30 minutes"
+                  className="w-full h-20 bg-slate-900 border border-slate-800 rounded-lg p-2.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-emerald-500 transition resize-none"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-slate-400 mb-1">Interval (Minutes)</label>
+                <input
+                  type="number"
+                  min={1}
+                  value={intervalMinutes}
+                  onChange={(e) => setIntervalMinutes(Number(e.target.value))}
+                  className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-xs text-slate-200 focus:outline-none focus:border-emerald-500 transition"
+                />
+              </div>
+              {scheduleStatus && (
+                <p className={`text-xs ${scheduleStatus.includes('failed') ? 'text-rose-400' : 'text-emerald-400'}`}>
+                  {scheduleStatus}
+                </p>
+              )}
+              <button
+                type="submit"
+                disabled={!scheduleGoal.trim()}
+                className="w-full bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-800 text-white font-medium py-2 rounded-lg text-xs transition flex items-center justify-center gap-1.5"
+              >
+                <Clock className="h-3.5 w-3.5" />
+                Create Scheduled Job
+              </button>
+            </form>
+
+            {/* Active Schedules List */}
+            <div className="flex-1 overflow-y-auto space-y-3">
+              <h4 className="text-xs uppercase tracking-wider font-semibold text-slate-400">Active Background Jobs</h4>
+              {schedules.length === 0 ? (
+                <p className="text-xs text-slate-500">No active background schedules found.</p>
+              ) : (
+                schedules.map((schedule) => (
+                  <div key={schedule.id} className="bg-slate-950 border border-slate-800 rounded-lg p-3 space-y-1.5">
+                    <div className="flex items-center justify-between">
+                      <span className="font-mono text-xs font-semibold text-emerald-400">{schedule.id}</span>
+                      <button
+                        onClick={() => handleDeleteSchedule(schedule.id)}
+                        className="p-1 text-slate-500 hover:text-rose-400 hover:bg-slate-900 rounded transition"
+                        title="Cancel job schedule"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                    <p className="text-xs text-slate-400">
+                      Trigger: <span className="text-slate-300 font-mono">{schedule.trigger}</span>
+                    </p>
+                    <p className="text-[11px] text-slate-500">
+                      Next Run: {new Date(schedule.next_run_time).toLocaleString()}
+                    </p>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Database Schema Side Drawer */}
+      {isSchemaDrawerOpen && (
         <div className="fixed inset-0 z-50 flex justify-end bg-slate-950/60 backdrop-blur-sm">
           <div className="w-full max-w-md bg-slate-900 border-l border-slate-800 h-full p-6 shadow-2xl flex flex-col space-y-6">
             <div className="flex items-center justify-between border-b border-slate-800 pb-4">
@@ -303,26 +570,39 @@ export default function Dashboard() {
                 <h3 className="text-lg font-semibold text-slate-100">Live Database Schema</h3>
               </div>
               <button
-                onClick={() => setIsDrawerOpen(false)}
+                onClick={() => setIsSchemaDrawerOpen(false)}
                 className="p-1 text-slate-400 hover:text-slate-100 hover:bg-slate-800 rounded transition"
               >
                 <X className="h-5 w-5" />
               </button>
             </div>
 
-            {/* Filter Toggle */}
-            <div className="flex items-center justify-between bg-slate-950 p-3 rounded-lg border border-slate-800">
-              <span className="text-xs text-slate-300 font-medium">Hide Internal System Tables</span>
-              <button
-                onClick={() => setHideDltTables(!hideDltTables)}
-                className={`p-1.5 rounded-md border transition ${hideDltTables
-                  ? 'bg-blue-950 border-blue-800 text-blue-400'
-                  : 'bg-slate-900 border-slate-800 text-slate-500'
-                  }`}
-                title={hideDltTables ? "Showing Business Tables Only" : "Showing All System Tables"}
-              >
-                {hideDltTables ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-              </button>
+            {/* Schema Search & Filter Controls */}
+            <div className="space-y-3">
+              <div className="relative">
+                <Search className="h-4 w-4 text-slate-500 absolute left-3 top-2.5" />
+                <input
+                  type="text"
+                  placeholder="Filter tables..."
+                  value={schemaSearch}
+                  onChange={(e) => setSchemaSearch(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg pl-9 pr-3 py-1.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-blue-500 transition"
+                />
+              </div>
+
+              <div className="flex items-center justify-between bg-slate-950 p-3 rounded-lg border border-slate-800">
+                <span className="text-xs text-slate-300 font-medium">Hide System Tables</span>
+                <button
+                  onClick={() => setHideDltTables(!hideDltTables)}
+                  className={`p-1.5 rounded-md border transition ${hideDltTables
+                      ? 'bg-blue-950 border-blue-800 text-blue-400'
+                      : 'bg-slate-900 border-slate-800 text-slate-500'
+                    }`}
+                  title={hideDltTables ? "Showing Business Tables Only" : "Showing All System Tables"}
+                >
+                  {hideDltTables ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                </button>
+              </div>
             </div>
 
             <div className="flex-1 overflow-y-auto space-y-6 pr-2">
