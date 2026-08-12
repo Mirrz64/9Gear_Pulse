@@ -24,6 +24,8 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(false);
   const [logs, setLogs] = useState<AuditLog[]>([]);
   const [schema, setSchema] = useState<SchemaMap>({});
+  const [generatedCode, setGeneratedCode] = useState<string>('');
+  const [activeTab, setActiveTab] = useState<'logs' | 'code'>('logs');
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [expandedLogId, setExpandedLogId] = useState<number | null>(null);
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
@@ -53,9 +55,22 @@ export default function Dashboard() {
     }
   };
 
+  const fetchCode = async () => {
+    try {
+      const res = await fetch('http://127.0.0.1:8000/api/code');
+      if (res.ok) {
+        const data = await res.json();
+        setGeneratedCode(data.code || '');
+      }
+    } catch (err) {
+      console.error('Failed to fetch generated code:', err);
+    }
+  };
+
   useEffect(() => {
     fetchLogs();
     fetchSchema();
+    fetchCode();
   }, []);
 
   const handleRunPipeline = async (e: React.FormEvent) => {
@@ -77,6 +92,7 @@ export default function Dashboard() {
         setGoal('');
         fetchLogs();
         fetchSchema();
+        fetchCode();
       } else {
         const err = await res.json();
         setStatusMessage(`Execution failed: ${err.detail || 'Unknown error'}`);
@@ -120,7 +136,7 @@ export default function Dashboard() {
               View Database Schema
             </button>
             <button
-              onClick={fetchLogs}
+              onClick={() => { fetchLogs(); fetchCode(); }}
               className="p-2 text-slate-400 hover:text-slate-100 hover:bg-slate-900 rounded-lg transition"
               title="Refresh Audit Logs"
             >
@@ -129,7 +145,7 @@ export default function Dashboard() {
           </div>
         </header>
 
-        {/* Input Card */}
+        {/* Pipeline Input Card */}
         <section className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-xl">
           <h2 className="text-lg font-semibold mb-3 flex items-center gap-2">
             <Database className="h-5 w-5 text-blue-400" />
@@ -210,14 +226,37 @@ export default function Dashboard() {
                       {expandedLogId === log.id && (
                         <tr className="bg-slate-950/80 border-b border-slate-800">
                           <td colSpan={6} className="p-4">
-                            <div className="space-y-2">
-                              <div className="flex items-center gap-2 text-xs font-semibold text-slate-300">
-                                <Terminal className="h-4 w-4 text-blue-400" />
-                                Execution & Self-Healing Terminal Logs
+                            <div className="space-y-3">
+                              {/* Tab Controls */}
+                              <div className="flex items-center gap-2 border-b border-slate-800 pb-2">
+                                <button
+                                  onClick={() => setActiveTab('logs')}
+                                  className={`flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-md transition ${activeTab === 'logs' ? 'bg-blue-950 border border-blue-800 text-blue-400' : 'text-slate-400 hover:text-slate-200'
+                                    }`}
+                                >
+                                  <Terminal className="h-3.5 w-3.5" />
+                                  Terminal Logs
+                                </button>
+                                <button
+                                  onClick={() => setActiveTab('code')}
+                                  className={`flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-md transition ${activeTab === 'code' ? 'bg-blue-950 border border-blue-800 text-blue-400' : 'text-slate-400 hover:text-slate-200'
+                                    }`}
+                                >
+                                  <Code className="h-3.5 w-3.5" />
+                                  Generated Python Code
+                                </button>
                               </div>
-                              <pre className="p-3 bg-slate-900 border border-slate-800 rounded-lg text-xs font-mono text-slate-300 overflow-x-auto whitespace-pre-wrap max-h-60">
-                                {log.logs || 'No log details recorded for this run.'}
-                              </pre>
+
+                              {/* Tab Contents */}
+                              {activeTab === 'logs' ? (
+                                <pre className="p-3 bg-slate-900 border border-slate-800 rounded-lg text-xs font-mono text-slate-300 overflow-x-auto whitespace-pre-wrap max-h-60">
+                                  {log.logs || 'No log details recorded for this run.'}
+                                </pre>
+                              ) : (
+                                <pre className="p-3 bg-slate-900 border border-slate-800 rounded-lg text-xs font-mono text-emerald-400 overflow-x-auto whitespace-pre-wrap max-h-60">
+                                  {generatedCode || '# No generated pipeline script available.'}
+                                </pre>
+                              )}
                             </div>
                           </td>
                         </tr>

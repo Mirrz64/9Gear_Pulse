@@ -76,3 +76,16 @@ def get_execution_logs():
             return {"logs": logs}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to query audit logs: {str(e)}")
+
+@app.get("/api/code")
+def get_generated_code():
+    """Returns the latest generated pipeline Python code from disk."""
+    code_path = "generated_pipeline.py"
+    if not os.path.exists(code_path):
+        return {"code": "# No generated pipeline script found on disk."}
+    try:
+        with open(code_path, "r", encoding="utf-8") as f:
+            code = f.read()
+        return {"code": code}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read code artifact: {str(e)}")
