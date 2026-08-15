@@ -1,0 +1,25 @@
+# Dependencies & Build Output
+**/node_modules
+**/.next
+**/build
+**/dist
+**/out
+
+# Python / Virtual Envs (since you're in backend too)
+**/venv
+**/__pycache__
+*.pyc
+
+# Version Control & Local Metadata
+.git
+.gitignore
+.DS_Store
+*.log
+
+# Docker / Environment Files
+.env*.local
+Dockerfile*
+docker-compose*
+
+# node_modules
+.next

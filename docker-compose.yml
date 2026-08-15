@@ -1,0 +1,66 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: 9gear_pulse_db
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-pulse_audit}
+      POSTGRES_USER: ${POSTGRES_USER:-pulse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pulse_secure_password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - pulse_net
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pulse} -d ${POSTGRES_DB:-pulse_audit}" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: ./backend
+    container_name: 9gear_pulse_engine
+    ports:
+      - "8000:8000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - PG_HOST=9gear_pulse_db
+      - PG_PORT=5432
+      - PG_DATABASE=${POSTGRES_DB:-pulse_audit}
+      - PG_USER=${POSTGRES_USER:-pulse}
+      - PG_PASSWORD=${POSTGRES_PASSWORD:-pulse_secure_password}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-pulse}:${POSTGRES_PASSWORD:-pulse_secure_password}@9gear_pulse_db:5432/${POSTGRES_DB:-pulse_audit}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - RUNNING_IN_DOCKER=true
+    networks:
+      - pulse_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    container_name: 9gear_pulse_ui
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    networks:
+      - pulse_net
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
+
+networks:
+  pulse_net:
+    driver: bridge

@@ -4,7 +4,8 @@ import React, { useState, useEffect, useRef, Fragment } from 'react';
 import {
   Play, Database, Activity, RefreshCw, CheckCircle, AlertCircle,
   ChevronDown, ChevronUp, Terminal, Table, X, Code, Eye, EyeOff,
-  PlusCircle, Search, Clock, Copy, Download, Calendar, Check, Trash2
+  PlusCircle, Search, Clock, Copy, Download, Calendar, Check, Trash2,
+  Radio
 } from 'lucide-react';
 
 interface AuditLog {
@@ -29,6 +30,9 @@ interface ScheduleJob {
   trigger: string;
 }
 
+const API_BASE_URL = '';
+// const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
+
 export default function Dashboard() {
   const [goal, setGoal] = useState('');
   const [loading, setLoading] = useState(false);
@@ -38,6 +42,11 @@ export default function Dashboard() {
   const [activeTab, setActiveTab] = useState<'logs' | 'code'>('logs');
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [expandedLogId, setExpandedLogId] = useState<number | null>(null);
+
+  // Live SSE Streaming State
+  const [liveStreamLogs, setLiveStreamLogs] = useState<string[]>([]);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const terminalEndRef = useRef<HTMLDivElement>(null);
 
   // Side Drawers
   const [isSchemaDrawerOpen, setIsSchemaDrawerOpen] = useState(false);
@@ -58,13 +67,20 @@ export default function Dashboard() {
   const [scheduleStatus, setScheduleStatus] = useState<string | null>(null);
 
   // Copy Feedback State
-  const [copiedType, setCopiedType] = useState<'code' | 'logs' | null>(null);
+  const [copiedType, setCopiedType] = useState<'code' | 'logs' | 'stream' | null>(null);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
+  // Helper for safe date formatting
+  const formatDate = (dateStr: string) => {
+    if (!dateStr) return 'N/A';
+    const parsed = new Date(dateStr);
+    return isNaN(parsed.getTime()) ? dateStr : parsed.toLocaleString();
+  };
+
   const fetchLogs = async () => {
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/logs');
+      const res = await fetch(`${API_BASE_URL}/api/logs`);
       if (res.ok) {
         const data = await res.json();
         setLogs(data.logs || []);
@@ -76,7 +92,7 @@ export default function Dashboard() {
 
   const fetchSchema = async () => {
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/schema');
+      const res = await fetch(`${API_BASE_URL}/api/schema`);
       if (res.ok) {
         const data = await res.json();
         setSchema(data.schema || {});
@@ -88,7 +104,7 @@ export default function Dashboard() {
 
   const fetchCode = async () => {
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/code');
+      const res = await fetch(`${API_BASE_URL}/api/code`);
       if (res.ok) {
         const data = await res.json();
         setGeneratedCode(data.code || '');
@@ -100,7 +116,7 @@ export default function Dashboard() {
 
   const fetchSchedules = async () => {
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/schedules');
+      const res = await fetch(`${API_BASE_URL}/api/schedules`);
       if (res.ok) {
         const data = await res.json();
         setSchedules(data.schedules || []);
@@ -117,15 +133,42 @@ export default function Dashboard() {
     fetchSchedules();
   }, []);
 
+  // Auto-scroll stream terminal to bottom
+  useEffect(() => {
+    if (isStreaming && terminalEndRef.current) {
+      terminalEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [liveStreamLogs, isStreaming]);
+
   const handleRunPipeline = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!goal.trim()) return;
 
     setLoading(true);
-    setStatusMessage('Generating code & executing in Docker sandbox...');
+    setIsStreaming(true);
+    setLiveStreamLogs([]);
+    setStatusMessage('Initiating pipeline execution...');
+
+    // Open SSE Connection for Live Logs
+    const jobId = `job_${Date.now()}`;
+    const eventSource = new EventSource(`${API_BASE_URL}/api/stream-logs/${jobId}`);
+
+    eventSource.onmessage = (event) => {
+      if (event.data === '[DONE]' || event.data === '[COMPLETE]') {
+        eventSource.close();
+        setIsStreaming(false);
+      } else {
+        setLiveStreamLogs((prev) => [...prev, event.data]);
+      }
+    };
+
+    eventSource.onerror = () => {
+      eventSource.close();
+      setIsStreaming(false);
+    };
 
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/run', {
+      const res = await fetch(`${API_BASE_URL}/api/run`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ goal, max_retries: 3 }),
@@ -154,7 +197,7 @@ export default function Dashboard() {
 
     setScheduleStatus('Scheduling job...');
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/schedule', {
+      const res = await fetch(`${API_BASE_URL}/api/schedule`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -179,7 +222,7 @@ export default function Dashboard() {
 
   const handleDeleteSchedule = async (jobId: string) => {
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/schedule/${jobId}`, {
+      const res = await fetch(`${API_BASE_URL}/api/schedule/${jobId}`, {
         method: 'DELETE',
       });
       if (res.ok) {
@@ -196,8 +239,8 @@ export default function Dashboard() {
       return;
     }
 
-    const start = textareaRef.current.selectionStart;
-    const end = textareaRef.current.selectionEnd;
+    const start = textareaRef.current.selectionStart ?? goal.length;
+    const end = textareaRef.current.selectionEnd ?? goal.length;
     const updatedGoal = goal.substring(0, start) + textToInsert + goal.substring(end);
 
     setGoal(updatedGoal);
@@ -210,7 +253,7 @@ export default function Dashboard() {
     }, 0);
   };
 
-  const copyToClipboard = (text: string, type: 'code' | 'logs') => {
+  const copyToClipboard = (text: string, type: 'code' | 'logs' | 'stream') => {
     navigator.clipboard.writeText(text);
     setCopiedType(type);
     setTimeout(() => setCopiedType(null), 2000);
@@ -232,7 +275,6 @@ export default function Dashboard() {
     setExpandedLogId(expandedLogId === id ? null : id);
   };
 
-  // Log Filtering Logic
   const filteredLogs = logs.filter((log) => {
     const matchesSearch =
       log.pipeline_name.toLowerCase().includes(searchQuery.toLowerCase()) ||
@@ -244,7 +286,6 @@ export default function Dashboard() {
     return matchesSearch && matchesStatus;
   });
 
-  // Schema Search & System Table Filtering Logic
   const filteredSchema = Object.entries(schema).filter(([tableName]) => {
     if (hideDltTables && (tableName.includes('_dlt_') || tableName.startsWith('_pipeline_audit'))) {
       return false;
@@ -283,13 +324,14 @@ export default function Dashboard() {
               onClick={() => { fetchLogs(); fetchCode(); fetchSchedules(); }}
               className="p-2 text-slate-400 hover:text-slate-100 hover:bg-slate-900 rounded-lg transition"
               title="Refresh Audit Logs"
+              aria-label="Refresh Audit Logs"
             >
               <RefreshCw className="h-5 w-5" />
             </button>
           </div>
         </header>
 
-        {/* Input Card */}
+        {/* Pipeline Execution Card */}
         <section className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-xl">
           <h2 className="text-lg font-semibold mb-3 flex items-center gap-2">
             <Database className="h-5 w-5 text-blue-400" />
@@ -322,12 +364,36 @@ export default function Dashboard() {
           </form>
         </section>
 
-        {/* Execution Audit Table Section */}
+        {/* Live Execution SSE Console */}
+        {(isStreaming || liveStreamLogs.length > 0) && (
+          <section className="bg-slate-900 border border-blue-900/50 rounded-xl p-6 shadow-xl space-y-3">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <div className="flex items-center gap-2">
+                <Radio className={`h-4 w-4 ${isStreaming ? 'text-emerald-400 animate-pulse' : 'text-slate-500'}`} />
+                <h3 className="text-sm font-semibold text-slate-200">Live Execution Terminal Stream</h3>
+              </div>
+              <button
+                onClick={() => copyToClipboard(liveStreamLogs.join('\n'), 'stream')}
+                className="flex items-center gap-1 text-xs bg-slate-950 hover:bg-slate-800 border border-slate-800 text-slate-300 px-2.5 py-1 rounded transition"
+              >
+                {copiedType === 'stream' ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : <Copy className="h-3.5 w-3.5" />}
+                {copiedType === 'stream' ? 'Copied!' : 'Copy Logs'}
+              </button>
+            </div>
+            <div className="bg-slate-950 border border-slate-800 rounded-lg p-4 h-48 overflow-y-auto font-mono text-xs text-emerald-400 space-y-1">
+              {liveStreamLogs.map((logLine, idx) => (
+                <div key={idx} className="whitespace-pre-wrap">{logLine}</div>
+              ))}
+              <div ref={terminalEndRef} />
+            </div>
+          </section>
+        )}
+
+        {/* Execution Audit Table */}
         <section className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-xl space-y-4">
           <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
             <h2 className="text-lg font-semibold">Execution Audit Logs</h2>
 
-            {/* Search and Filters */}
             <div className="flex flex-wrap items-center gap-3">
               <div className="relative">
                 <Search className="h-4 w-4 text-slate-500 absolute left-3 top-2.5" />
@@ -345,8 +411,8 @@ export default function Dashboard() {
                     key={status}
                     onClick={() => setStatusFilter(status)}
                     className={`px-3 py-1 rounded-md text-xs font-semibold transition ${statusFilter === status
-                        ? 'bg-blue-600 text-white'
-                        : 'text-slate-400 hover:text-slate-200'
+                      ? 'bg-blue-600 text-white'
+                      : 'text-slate-400 hover:text-slate-200'
                       }`}
                   >
                     {status}
@@ -392,9 +458,9 @@ export default function Dashboard() {
                           </span>
                         </td>
                         <td className="p-3 font-mono text-xs">{log.attempts}</td>
-                        <td className="p-3 text-xs">{new Date(log.execution_time).toLocaleString()}</td>
+                        <td className="p-3 text-xs">{formatDate(log.execution_time)}</td>
                         <td className="p-3 text-right">
-                          <button className="text-slate-400 hover:text-slate-200 p-1">
+                          <button className="text-slate-400 hover:text-slate-200 p-1" aria-label="Toggle Details">
                             {expandedLogId === log.id ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
                           </button>
                         </td>
@@ -403,7 +469,6 @@ export default function Dashboard() {
                         <tr className="bg-slate-950/80 border-b border-slate-800">
                           <td colSpan={6} className="p-4">
                             <div className="space-y-3">
-                              {/* Header & Export Controls */}
                               <div className="flex items-center justify-between border-b border-slate-800 pb-2">
                                 <div className="flex items-center gap-2">
                                   <button
@@ -424,7 +489,6 @@ export default function Dashboard() {
                                   </button>
                                 </div>
 
-                                {/* Export Controls */}
                                 <div className="flex items-center gap-2">
                                   <button
                                     onClick={() => copyToClipboard(
@@ -432,7 +496,6 @@ export default function Dashboard() {
                                       activeTab
                                     )}
                                     className="flex items-center gap-1 text-xs bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 px-2.5 py-1 rounded transition"
-                                    title="Copy content to clipboard"
                                   >
                                     {copiedType === activeTab ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : <Copy className="h-3.5 w-3.5" />}
                                     {copiedType === activeTab ? 'Copied!' : 'Copy'}
@@ -443,7 +506,6 @@ export default function Dashboard() {
                                       activeTab === 'logs' ? `execution_log_${log.id}.log` : `${log.pipeline_name}.py`
                                     )}
                                     className="flex items-center gap-1 text-xs bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 px-2.5 py-1 rounded transition"
-                                    title="Download artifact file"
                                   >
                                     <Download className="h-3.5 w-3.5 text-blue-400" />
                                     Download
@@ -451,7 +513,6 @@ export default function Dashboard() {
                                 </div>
                               </div>
 
-                              {/* Tab Contents */}
                               {activeTab === 'logs' ? (
                                 <pre className="p-3 bg-slate-900 border border-slate-800 rounded-lg text-xs font-mono text-slate-300 overflow-x-auto whitespace-pre-wrap max-h-60">
                                   {log.logs || 'No log details recorded for this run.'}
@@ -474,7 +535,7 @@ export default function Dashboard() {
         </section>
       </div>
 
-      {/* Pipeline Scheduling Drawer */}
+      {/* Scheduler Drawer */}
       {isScheduleDrawerOpen && (
         <div className="fixed inset-0 z-50 flex justify-end bg-slate-950/60 backdrop-blur-sm">
           <div className="w-full max-w-md bg-slate-900 border-l border-slate-800 h-full p-6 shadow-2xl flex flex-col space-y-6">
@@ -486,12 +547,12 @@ export default function Dashboard() {
               <button
                 onClick={() => setIsScheduleDrawerOpen(false)}
                 className="p-1 text-slate-400 hover:text-slate-100 hover:bg-slate-800 rounded transition"
+                aria-label="Close Scheduler Drawer"
               >
                 <X className="h-5 w-5" />
               </button>
             </div>
 
-            {/* Schedule New Job Form */}
             <form onSubmit={handleSchedulePipeline} className="space-y-4 bg-slate-950 p-4 rounded-xl border border-slate-800">
               <h4 className="text-xs uppercase tracking-wider font-semibold text-slate-400">Schedule Recurring Pipeline</h4>
               <div>
@@ -528,7 +589,6 @@ export default function Dashboard() {
               </button>
             </form>
 
-            {/* Active Schedules List */}
             <div className="flex-1 overflow-y-auto space-y-3">
               <h4 className="text-xs uppercase tracking-wider font-semibold text-slate-400">Active Background Jobs</h4>
               {schedules.length === 0 ? (
@@ -541,7 +601,7 @@ export default function Dashboard() {
                       <button
                         onClick={() => handleDeleteSchedule(schedule.id)}
                         className="p-1 text-slate-500 hover:text-rose-400 hover:bg-slate-900 rounded transition"
-                        title="Cancel job schedule"
+                        aria-label="Delete schedule"
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>
@@ -550,7 +610,7 @@ export default function Dashboard() {
                       Trigger: <span className="text-slate-300 font-mono">{schedule.trigger}</span>
                     </p>
                     <p className="text-[11px] text-slate-500">
-                      Next Run: {new Date(schedule.next_run_time).toLocaleString()}
+                      Next Run: {formatDate(schedule.next_run_time)}
                     </p>
                   </div>
                 ))
@@ -560,7 +620,7 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* Database Schema Side Drawer */}
+      {/* Schema Drawer */}
       {isSchemaDrawerOpen && (
         <div className="fixed inset-0 z-50 flex justify-end bg-slate-950/60 backdrop-blur-sm">
           <div className="w-full max-w-md bg-slate-900 border-l border-slate-800 h-full p-6 shadow-2xl flex flex-col space-y-6">
@@ -572,12 +632,12 @@ export default function Dashboard() {
               <button
                 onClick={() => setIsSchemaDrawerOpen(false)}
                 className="p-1 text-slate-400 hover:text-slate-100 hover:bg-slate-800 rounded transition"
+                aria-label="Close Schema Drawer"
               >
                 <X className="h-5 w-5" />
               </button>
             </div>
 
-            {/* Schema Search & Filter Controls */}
             <div className="space-y-3">
               <div className="relative">
                 <Search className="h-4 w-4 text-slate-500 absolute left-3 top-2.5" />
@@ -595,10 +655,10 @@ export default function Dashboard() {
                 <button
                   onClick={() => setHideDltTables(!hideDltTables)}
                   className={`p-1.5 rounded-md border transition ${hideDltTables
-                      ? 'bg-blue-950 border-blue-800 text-blue-400'
-                      : 'bg-slate-900 border-slate-800 text-slate-500'
+                    ? 'bg-blue-950 border-blue-800 text-blue-400'
+                    : 'bg-slate-900 border-slate-800 text-slate-500'
                     }`}
-                  title={hideDltTables ? "Showing Business Tables Only" : "Showing All System Tables"}
+                  aria-label="Toggle System Tables Visibility"
                 >
                   {hideDltTables ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                 </button>
@@ -618,7 +678,6 @@ export default function Dashboard() {
                       <button
                         onClick={() => insertMetadataIntoGoal(tableName)}
                         className="flex items-center gap-1 text-[11px] text-slate-400 hover:text-blue-400 transition"
-                        title="Insert table name into prompt"
                       >
                         <PlusCircle className="h-3.5 w-3.5" />
                         Insert
@@ -627,10 +686,9 @@ export default function Dashboard() {
                     <ul className="space-y-1.5 text-xs font-mono text-slate-300">
                       {columns.map((col, idx) => (
                         <li
-                          key={idx}
+                          key={`${tableName}-${col.column_name}-${idx}`}
                           onClick={() => insertMetadataIntoGoal(col.column_name)}
                           className="flex justify-between items-center p-1 rounded hover:bg-slate-900 cursor-pointer transition group"
-                          title="Click to insert column into prompt"
                         >
                           <span className="group-hover:text-blue-300">{col.column_name}</span>
                           <span className="text-slate-500 text-[10px] bg-slate-900 group-hover:bg-slate-800 px-2 py-0.5 rounded border border-slate-800">

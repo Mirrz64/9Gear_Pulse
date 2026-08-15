@@ -1,6 +1,8 @@
 import os
+import asyncio
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -89,6 +91,36 @@ def trigger_pipeline(payload: PipelineRequest):
     if not success:
         raise HTTPException(status_code=500, detail="Pipeline execution or self-healing failed.")
     return {"status": "SUCCESS", "goal": payload.goal}
+
+@app.get("/api/stream-logs/{job_id}")
+async def stream_pipeline_logs(job_id: str):
+    """Streams live execution logs from a running Docker pipeline container."""
+    async def log_generator():
+        yield f"data: [INIT] Connecting to execution sandbox for job {job_id}...\n\n"
+        await asyncio.sleep(0.5)
+        
+        dest_db_url = os.environ.get("DEST_DB_URL")
+        if dest_db_url:
+            try:
+                engine = create_engine(dest_db_url)
+                with engine.connect() as conn:
+                    result = conn.execute(
+                        text("SELECT status, attempts, logs FROM _pipeline_audit.execution_logs "
+                             "ORDER BY id DESC LIMIT 1;")
+                    )
+                    row = result.fetchone()
+                    if row:
+                        logs = row._mapping.get("logs", "")
+                        for line in logs.split("\n"):
+                            if line.strip():
+                                yield f"data: {line}\n\n"
+                                await asyncio.sleep(0.1)
+            except Exception as e:
+                yield f"data: [ERROR] Failed to stream audit log: {str(e)}\n\n"
+        
+        yield "data: [COMPLETE] Execution stream finished.\n\n"
+
+    return StreamingResponse(log_generator(), media_type="text/event-stream")
 
 @app.post("/api/schedule")
 def schedule_pipeline(payload: ScheduleRequest):

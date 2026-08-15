@@ -3,14 +3,20 @@ import json
 import re
 import docker
 import anthropic
+import openai
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-if "ANTHROPIC_API_KEY" not in os.environ:
-    raise ValueError("Missing ANTHROPIC_API_KEY in environment variables or .env file.")
+# Initialize clients if keys exist in environment
+anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+openai_key = os.getenv("OPENAI_API_KEY")
 
-client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+if not anthropic_key and not openai_key:
+    raise ValueError("Missing both ANTHROPIC_API_KEY and OPENAI_API_KEY. At least one must be set in .env")
+
+anthropic_client = anthropic.Anthropic(api_key=anthropic_key) if anthropic_key else None
+openai_client = openai.OpenAI(api_key=openai_key) if openai_key else None
 
 HEALER_SYSTEM_PROMPT = """You are an expert Python data engineering agent specializing in `dlt` and database pipelines.
 You are given a broken Python ETL script, schema metadata of the source database, and the runtime error/traceback produced when executing it inside a Docker container.
@@ -37,9 +43,7 @@ def clean_json_response(raw_text: str) -> str:
 
 
 def run_in_sandbox(script_path: str) -> tuple[bool, str]:
-    """Runs the specified script in an isolated Docker container.
-    Returns a tuple: (success: bool, logs: str)
-    """
+    """Runs the specified script in an isolated Docker container."""
     docker_client = docker.from_env()
     abs_path = os.path.abspath(script_path)
     image_name = "python:3.10-slim"
@@ -74,34 +78,63 @@ def run_in_sandbox(script_path: str) -> tuple[bool, str]:
 
 
 def heal_script(broken_code: str, error_log: str, schema_summary: dict = None) -> str:
-    """Passes broken code, schema context, and execution error traceback to Claude for repair."""
+    """Attempts code repair using Anthropic Claude first, falling back to OpenAI GPT-4o on error."""
+    
+    # default=str handles datetime/non-serializable objects cleanly
     user_prompt = json.dumps({
         "broken_code": broken_code,
         "error_traceback": error_log,
         "schema_summary": schema_summary or {}
-    })
+    }, default=str)
 
-    response = client.messages.create(
-        model="claude-sonnet-5",
-        max_tokens=4000,
-        system=HEALER_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_prompt}],
-    )
+    # Primary Attempt: Anthropic Claude 3.5 Sonnet
+    if anthropic_client:
+        try:
+            print("[Self-Healer] Contacting Primary AI Provider: Anthropic (Claude 3.5 Sonnet)...")
+            response = anthropic_client.messages.create(
+                model="claude-3-5-sonnet-20241022",
+                max_tokens=4000,
+                system=HEALER_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
 
-    text_blocks = [
-        block.text for block in response.content 
-        if getattr(block, "type", None) == "text" or hasattr(block, "text")
-    ]
-    if not text_blocks:
-        raise ValueError("No text content block found in model response.")
+            text_blocks = [
+                block.text for block in response.content 
+                if getattr(block, "type", None) == "text" or hasattr(block, "text")
+            ]
+            if text_blocks:
+                cleaned = clean_json_response(text_blocks[0])
+                parsed = json.loads(cleaned)
+                print(f"[Healer Diagnosis (Anthropic)]: {parsed.get('root_cause', 'N/A')}")
+                print(f"[Changes Applied]: {parsed.get('changes_made', 'N/A')}\n")
+                return parsed["fixed_code"]
 
-    cleaned = clean_json_response(text_blocks[0])
-    parsed = json.loads(cleaned)
-    
-    print(f"\n[Healer Diagnosis]: {parsed.get('root_cause', 'N/A')}")
-    print(f"[Changes Applied]: {parsed.get('changes_made', 'N/A')}\n")
-    
-    return parsed["fixed_code"]
+        except Exception as e:
+            print(f"[Warning] Anthropic API failed or encountered error: {e}")
+            print("[Self-Healer] Switching over to Fallback AI Provider: OpenAI (GPT-4o)...")
+
+    # Fallback Attempt: OpenAI GPT-4o
+    if openai_client:
+        try:
+            response = openai_client.chat.completions.create(
+                model="gpt-4o",
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": HEALER_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt}
+                ]
+            )
+
+            cleaned = clean_json_response(response.choices[0].message.content)
+            parsed = json.loads(cleaned)
+            print(f"[Healer Diagnosis (OpenAI Fallback)]: {parsed.get('root_cause', 'N/A')}")
+            print(f"[Changes Applied]: {parsed.get('changes_made', 'N/A')}\n")
+            return parsed["fixed_code"]
+
+        except Exception as e:
+            raise RuntimeError(f"OpenAI fallback execution failed: {e}")
+
+    raise ValueError("Neither Anthropic nor OpenAI execution succeeded.")
 
 
 def execute_with_self_healing(
@@ -109,9 +142,7 @@ def execute_with_self_healing(
     schema_summary: dict = None, 
     max_retries: int = 3
 ) -> tuple[bool, int, str]:
-    """Executes a pipeline script in the sandbox and attempts auto-repair on failure up to max_retries.
-    Returns: (success: bool, total_attempts: int, execution_logs: str)
-    """
+    """Executes script in sandbox and auto-repairs on failure up to max_retries."""
     if schema_summary is None:
         from introspect import introspect_schema
         schema_summary = introspect_schema()
