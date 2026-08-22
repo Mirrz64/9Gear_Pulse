@@ -155,3 +155,4 @@ __pycache__/
 backend/__pycache__/
 .env
 backend/.env
+backend/9gear_pulse.db

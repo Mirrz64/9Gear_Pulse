@@ -10,7 +10,9 @@ import re
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, inspect, text
 
-load_dotenv(override=True)
+# Compose supplies an in-network DATABASE_URL. A host-only URL in .env must
+# not replace it once this module is running inside the backend container.
+load_dotenv(override=False)
 
 
 def json_serial(obj):
@@ -46,12 +48,12 @@ def get_db_url() -> str:
     return f"postgresql://{pg_user}:{pg_pass}@{pg_host}:{pg_port}/{pg_db}"
 
 
-def introspect_schema(schema_name: str = None, sample_rows: int = 3) -> dict:
+def introspect_schema(schema_name: str = None, sample_rows: int = 3, db_url: str = None) -> dict:
     """Returns: { full_table_name: { columns: [...], row_count: int, sample: [...] } }
 
     Works with both PostgreSQL and SQLite backends via SQLAlchemy reflection.
     """
-    db_url = get_db_url()
+    db_url = db_url or get_db_url()
     engine_kwargs = {}
 
     if db_url.startswith("sqlite"):

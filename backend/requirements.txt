@@ -6,6 +6,7 @@ python-multipart>=0.0.32
 # Database & ORM
 SQLAlchemy>=2.0.51
 psycopg2-binary>=2.9.12
+alembic>=1.13.0
 
 # AI / LLM Providers
 openai>=1.58.0
@@ -21,6 +22,7 @@ apscheduler>=3.11.3
 python-dotenv>=1.2.2
 pydantic>=2.13.4
 pydantic-settings>=2.15.0
+cryptography>=44.0.0
 
 # Utilities
 httpx>=0.28.1

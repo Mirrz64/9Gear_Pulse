@@ -7,7 +7,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-pulse}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pulse_secure_password}
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     networks:

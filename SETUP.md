@@ -41,3 +41,24 @@ to `generated_pipeline.py`.
 judge it on whether the generated code is *correct* for 5–10 different
 goals against your real schema shapes. That accuracy number is what
 Phase 2 (the Docker sandbox + self-healing loop) gets built on top of.
+
+**Step 3 — start the actual API server for the Next.js frontend:**
+
+Running `python main.py` or `python app.py` on their own will NOT start a
+web server — neither file calls `uvicorn.run()` directly (only the
+Dockerfile did, via its CMD). From the `backend/` directory, with your
+venv active:
+
+```bash
+uvicorn app:app --reload --port 8000
+```
+
+Run this from the same directory as your `.env` and `9gear_pulse.db` —
+the SQLite path in `.env` is relative (`sqlite:///./9gear_pulse.db`), so
+starting uvicorn from anywhere else will silently create/read a *different*,
+empty database file instead of the one `init_db.py` seeded.
+
+Leave this running in its own terminal, then start the frontend
+(`npm run dev` in `frontend/`) in another. `app.py` is the only file that
+should ever be served — `main.py` is just the pipeline orchestrator +
+CLI, imported by `app.py`, not a second server.

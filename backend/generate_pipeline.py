@@ -13,14 +13,11 @@ from dotenv import load_dotenv
 import anthropic
 import openai
 
-load_dotenv(override=True)
+load_dotenv(override=False)
 
 # Initialize clients if environment variables exist
 anthropic_key = os.getenv("ANTHROPIC_API_KEY")
 openai_key = os.getenv("OPENAI_API_KEY")
-
-if not anthropic_key and not openai_key:
-    raise ValueError("Missing both ANTHROPIC_API_KEY and OPENAI_API_KEY in environment variables or .env file.")
 
 anthropic_client = anthropic.Anthropic(api_key=anthropic_key) if anthropic_key else None
 openai_client = openai.OpenAI(api_key=openai_key) if openai_key else None
@@ -33,6 +30,28 @@ Connection details (host, user, password, etc.) will be injected as \
 environment variables at run time by the calling system. Never invent, \
 guess, or reference specific credential values — read them from os.environ \
 using generic names like SOURCE_DB_URL / DEST_DB_URL.
+
+Destination Requirements — this is mandatory, do not deviate:
+- The actual destination database engine (SQLite, Postgres, or otherwise) is \
+not known to you and can vary at runtime. NEVER use an engine-specific \
+destination like `dlt.destinations.postgres(...)`, `dlt.destinations.mysql(...)`, \
+etc. — guessing the wrong one is a common and completely avoidable failure.
+- Always use the generic SQLAlchemy destination instead, which auto-detects \
+the correct dialect from the connection string itself and works identically \
+across SQLite, Postgres, and other SQL engines. Set it up exactly like this:
+
+    import sqlalchemy as sa
+    dest_engine = sa.create_engine(os.environ["DEST_DB_URL"])
+    pipeline = dlt.pipeline(
+        pipeline_name="...",
+        destination=dlt.destinations.sqlalchemy(dest_engine),
+        dataset_name="...",
+    )
+
+- Never call helper functions that do not exist in the `dlt` public API (for \
+example, there is no `dlt.postgres.credentials_parse`). Pass either a raw \
+connection string or an actual `sqlalchemy.Engine` object, as shown above — \
+nothing else.
 
 Schema Drift Requirements:
 - Configure schema contracts explicitly on the pipeline or resources to handle schema evolution cleanly.
@@ -105,7 +124,7 @@ def generate_pipeline(schema_summary: dict, goal: str) -> dict:
         except Exception as e:
             raise RuntimeError(f"OpenAI fallback pipeline generation failed: {e}")
 
-    raise ValueError("Neither Anthropic nor OpenAI execution succeeded.")
+    raise ValueError("No AI provider is configured. Set ANTHROPIC_API_KEY or OPENAI_API_KEY.")
 
 
 if __name__ == "__main__":

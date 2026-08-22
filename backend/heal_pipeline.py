@@ -6,14 +6,13 @@ import anthropic
 import openai
 from dotenv import load_dotenv
 
-load_dotenv(override=True)
+from introspect import get_db_url
+
+load_dotenv(override=False)
 
 # Initialize clients if keys exist in environment
 anthropic_key = os.getenv("ANTHROPIC_API_KEY")
 openai_key = os.getenv("OPENAI_API_KEY")
-
-if not anthropic_key and not openai_key:
-    raise ValueError("Missing both ANTHROPIC_API_KEY and OPENAI_API_KEY. At least one must be set in .env")
 
 anthropic_client = anthropic.Anthropic(api_key=anthropic_key) if anthropic_key else None
 openai_client = openai.OpenAI(api_key=openai_key) if openai_key else None
@@ -25,6 +24,13 @@ Your job is to fix the code so that it executes without errors.
 - Preserve the overall pipeline logic and business goal.
 - Use actual existing tables and columns defined in the schema summary.
 - Do NOT invent database credentials; keep reading from environment variables (SOURCE_DB_URL, DEST_DB_URL).
+- Only call functions that genuinely exist in the `dlt` public API. If you are not certain a function exists, do not use it.
+- The destination database engine (SQLite, Postgres, etc.) is not known ahead of time and must never be assumed. If the error is destination/credentials-related, the fix is always the generic SQLAlchemy destination, which auto-detects the right dialect from the connection string - never an engine-specific one like `dlt.destinations.postgres(...)`:
+
+      import sqlalchemy as sa
+      dest_engine = sa.create_engine(os.environ["DEST_DB_URL"])
+      destination=dlt.destinations.sqlalchemy(dest_engine)
+
 - Return ONLY valid JSON matching this exact structure with no extra text or explanations:
 
 {
@@ -42,16 +48,58 @@ def clean_json_response(raw_text: str) -> str:
     return text.strip()
 
 
-def run_in_sandbox(script_path: str) -> tuple[bool, str]:
+def _resolve_sandbox_db_urls(script_dir: str, source_db_url: str = None, dest_db_url: str = None):
+    """The sandbox container is fully isolated: it can't reach 'localhost'
+    on the host machine, and it has no access to the host filesystem unless
+    something is explicitly mounted in. This used to hardcode a Postgres
+    connection (postgres:devpass@host.docker.internal:5433/testdb) that
+    matched nothing in this project's actual config.
+
+    Instead, this resolves whatever SOURCE_DB_URL/DEST_DB_URL (or the same
+    DATABASE_URL/PG_* fallback introspect.py already uses) is genuinely
+    configured, and adapts it so the sandbox container can actually reach
+    it - by mounting the file in for SQLite, or swapping 'localhost' for
+    the special Docker host DNS name for Postgres.
+
+    Returns (source_url, dest_url, extra_volumes: dict)
+    """
+    source_url = source_db_url or os.environ.get("SOURCE_DB_URL") or get_db_url()
+    dest_url = dest_db_url or os.environ.get("DEST_DB_URL") or source_url
+
+    extra_volumes = {}
+
+    def adapt(url: str) -> str:
+        if url.startswith("sqlite"):
+            db_filename = url.split("/")[-1]
+            host_path = os.path.abspath(os.path.join(script_dir, db_filename))
+            container_path = f"/data/{db_filename}"
+            if os.path.exists(host_path):
+                extra_volumes[host_path] = {"bind": container_path, "mode": "rw"}
+            return f"sqlite:///{container_path}"
+        # Postgres (or anything else network-based): 'localhost'/'127.0.0.1'
+        # on the host isn't reachable from inside the sandbox container.
+        return (
+            url.replace("localhost", "host.docker.internal")
+               .replace("127.0.0.1", "host.docker.internal")
+        )
+
+    return adapt(source_url), adapt(dest_url), extra_volumes
+
+
+def run_in_sandbox(script_path: str, source_db_url: str = None, dest_db_url: str = None) -> tuple[bool, str]:
     """Runs the specified script in an isolated Docker container."""
-    docker_client = docker.from_env()
     abs_path = os.path.abspath(script_path)
+    script_dir = os.path.dirname(abs_path) or "."
     image_name = "python:3.10-slim"
 
+    source_url, dest_url, extra_volumes = _resolve_sandbox_db_urls(script_dir, source_db_url, dest_db_url)
     env_vars = {
-        "SOURCE_DB_URL": "postgresql://postgres:devpass@host.docker.internal:5433/testdb",
-        "DEST_DB_URL": "postgresql://postgres:devpass@host.docker.internal:5433/testdb",
+        "SOURCE_DB_URL": source_url,
+        "DEST_DB_URL": dest_url,
     }
+
+    volumes = {abs_path: {'bind': '/app/pipeline.py', 'mode': 'ro'}}
+    volumes.update(extra_volumes)
 
     setup_and_run_cmd = (
         '/bin/bash -c "pip install --quiet --disable-pip-version-check --no-warn-script-location '
@@ -59,10 +107,15 @@ def run_in_sandbox(script_path: str) -> tuple[bool, str]:
     )
 
     try:
+        # docker.from_env() used to sit outside this try block, so a down
+        # Docker daemon (very possible on Windows if Docker Desktop isn't
+        # running) crashed the whole request as an unhandled exception
+        # instead of being treated as one failed sandbox attempt.
+        docker_client = docker.from_env()
         container = docker_client.containers.run(
             image=image_name,
             command=setup_and_run_cmd,
-            volumes={abs_path: {'bind': '/app/pipeline.py', 'mode': 'ro'}},
+            volumes=volumes,
             environment=env_vars,
             extra_hosts={"host.docker.internal": "host-gateway"},
             detach=True
@@ -87,12 +140,12 @@ def heal_script(broken_code: str, error_log: str, schema_summary: dict = None) -
         "schema_summary": schema_summary or {}
     }, default=str)
 
-    # Primary Attempt: Anthropic Claude 3.5 Sonnet
+    # Primary Attempt: Anthropic Claude Sonnet 5
     if anthropic_client:
         try:
-            print("[Self-Healer] Contacting Primary AI Provider: Anthropic (Claude 3.5 Sonnet)...")
+            print("[Self-Healer] Contacting Primary AI Provider: Anthropic (Claude Sonnet 5)...")
             response = anthropic_client.messages.create(
-                model="claude-3-5-sonnet-20241022",
+                model="claude-sonnet-5",
                 max_tokens=4000,
                 system=HEALER_SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": user_prompt}],
@@ -140,7 +193,9 @@ def heal_script(broken_code: str, error_log: str, schema_summary: dict = None) -
 def execute_with_self_healing(
     script_path: str, 
     schema_summary: dict = None, 
-    max_retries: int = 3
+    max_retries: int = 3,
+    source_db_url: str = None,
+    dest_db_url: str = None,
 ) -> tuple[bool, int, str]:
     """Executes script in sandbox and auto-repairs on failure up to max_retries."""
     if schema_summary is None:
@@ -150,7 +205,7 @@ def execute_with_self_healing(
     last_logs = ""
     for attempt in range(1, max_retries + 1):
         print(f"--- Sandbox Run (Attempt {attempt}/{max_retries}) ---")
-        success, logs = run_in_sandbox(script_path)
+        success, logs = run_in_sandbox(script_path, source_db_url, dest_db_url)
         last_logs = logs
 
         if success:

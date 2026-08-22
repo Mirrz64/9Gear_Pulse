@@ -4,11 +4,17 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import create_engine, text
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from main import run_end_to_end_pipeline
 from introspect import introspect_schema
+from logger import get_audit_logs
+
+if os.environ.get("DATABASE_URL", "").startswith("postgresql"):
+    from schedule_service import scheduler, restore_schedules
+else:
+    scheduler = BackgroundScheduler()
+    restore_schedules = None
 
 app = FastAPI(
     title="9Gear Pulse API",
@@ -16,13 +22,12 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Initialize Background Scheduler
-scheduler = BackgroundScheduler()
-
 @app.on_event("startup")
 def start_scheduler():
     if not scheduler.running:
         scheduler.start()
+    if restore_schedules:
+        restore_schedules()
 
 @app.on_event("shutdown")
 def stop_scheduler():
@@ -37,6 +42,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# The legacy prototype can still run against its SQLite database. The review
+# gate deliberately appears only when this service is pointed at Postgres.
+if os.environ.get("DATABASE_URL", "").startswith("postgresql"):
+    from review_api import router as review_router
+    app.include_router(review_router)
 
 class PipelineRequest(BaseModel):
     goal: str
@@ -87,9 +97,18 @@ def get_generated_code():
 @app.post("/api/run")
 def trigger_pipeline(payload: PipelineRequest):
     """Triggers schema introspection, pipeline generation, Docker sandboxing, and audit logging."""
-    success = run_end_to_end_pipeline(goal=payload.goal, max_retries=payload.max_retries)
+    # Previously had no try/except at all, so an unhandled exception (e.g.
+    # Docker not running) escaped as Starlette's default plain-text 500
+    # response instead of JSON - the frontend's `await res.json()` then
+    # throws on that non-JSON body and lands in its catch block, showing
+    # the generic "Failed to connect to FastAPI backend" even when the
+    # backend was reachable and the real cause was something else.
+    try:
+        success = run_end_to_end_pipeline(goal=payload.goal, max_retries=payload.max_retries)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Pipeline orchestrator error: {str(e)}")
     if not success:
-        raise HTTPException(status_code=500, detail="Pipeline execution or self-healing failed.")
+        raise HTTPException(status_code=500, detail="Pipeline execution or self-healing failed. Check the audit logs for details.")
     return {"status": "SUCCESS", "goal": payload.goal}
 
 @app.get("/api/stream-logs/{job_id}")
@@ -99,24 +118,16 @@ async def stream_pipeline_logs(job_id: str):
         yield f"data: [INIT] Connecting to execution sandbox for job {job_id}...\n\n"
         await asyncio.sleep(0.5)
         
-        dest_db_url = os.environ.get("DEST_DB_URL")
-        if dest_db_url:
-            try:
-                engine = create_engine(dest_db_url)
-                with engine.connect() as conn:
-                    result = conn.execute(
-                        text("SELECT status, attempts, logs FROM _pipeline_audit.execution_logs "
-                             "ORDER BY id DESC LIMIT 1;")
-                    )
-                    row = result.fetchone()
-                    if row:
-                        logs = row._mapping.get("logs", "")
-                        for line in logs.split("\n"):
-                            if line.strip():
-                                yield f"data: {line}\n\n"
-                                await asyncio.sleep(0.1)
-            except Exception as e:
-                yield f"data: [ERROR] Failed to stream audit log: {str(e)}\n\n"
+        try:
+            recent = get_audit_logs(limit=1)
+            if recent:
+                logs = recent[0].get("logs", "") or ""
+                for line in logs.split("\n"):
+                    if line.strip():
+                        yield f"data: {line}\n\n"
+                        await asyncio.sleep(0.1)
+        except Exception as e:
+            yield f"data: [ERROR] Failed to stream audit log: {str(e)}\n\n"
         
         yield "data: [COMPLETE] Execution stream finished.\n\n"
 
@@ -162,20 +173,10 @@ def list_schedules():
 
 @app.get("/api/logs")
 def get_execution_logs():
-    """Queries audit log records from PostgreSQL."""
-    dest_db_url = os.environ.get("DEST_DB_URL")
-    if not dest_db_url:
-        raise HTTPException(status_code=500, detail="DEST_DB_URL not configured")
-
-    engine = create_engine(dest_db_url)
+    """Queries audit log records from pipeline_audit_logs."""
     try:
-        with engine.connect() as conn:
-            result = conn.execute(
-                text("SELECT id, pipeline_name, status, attempts, execution_time, logs "
-                     "FROM _pipeline_audit.execution_logs ORDER BY id DESC LIMIT 20;")
-            )
-            logs = [dict(row._mapping) for row in result]
-            return {"logs": logs}
+        logs = get_audit_logs()
+        return {"logs": logs}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to query audit logs: {str(e)}")
 
@@ -188,3 +189,11 @@ def delete_schedule(job_id: str):
     
     scheduler.remove_job(job_id)
     return {"status": "DELETED", "job_id": job_id}
+
+
+if __name__ == "__main__":
+    # Neither app.py nor main.py previously called uvicorn.run() anywhere —
+    # the only thing that actually started a server was the Dockerfile's
+    # `uvicorn app:app` CMD. This lets `python app.py` work too.
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
