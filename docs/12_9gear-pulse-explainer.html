@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>9Gear Pulse — From Manual ETL to AI-Reviewed Pipelines</title>
+<style>
+  :root {
+    --cream: #f6f4fb;
+    --ink: #1e1b2e;
+    --ink-soft: #4b4560;
+    --violet: #7c3aed;
+    --violet-deep: #5b21b6;
+    --violet-pale: #ede9fe;
+    --cyan: #0891b2;
+    --cyan-pale: #cffafe;
+    --amber: #b45309;
+    --amber-pale: #fef3c7;
+    --emerald: #047857;
+    --emerald-pale: #d1fae5;
+    --rose: #be123c;
+    --rose-pale: #ffe4e6;
+    --line: #e2def5;
+    --card: #ffffff;
+    --sans: ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background:
+      radial-gradient(circle at 8% 0%, #ede9fe 0%, transparent 45%),
+      radial-gradient(circle at 100% 15%, #cffafe 0%, transparent 40%),
+      var(--cream);
+    color: var(--ink);
+    font-family: var(--sans);
+    padding: 40px 32px 48px;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; }
+
+  /* ---- Header ---- */
+  header { text-align: center; margin-bottom: 34px; }
+  h1 {
+    font-size: 40px;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    margin: 0 0 10px;
+    line-height: 1.15;
+  }
+  h1 .accent {
+    background: linear-gradient(90deg, var(--violet), var(--cyan));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  header p {
+    font-size: 15px;
+    color: var(--ink-soft);
+    margin: 0;
+  }
+  header p b { color: var(--violet-deep); font-weight: 700; }
+
+  /* ---- Step strip ---- */
+  .steps {
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+    margin: 30px 0 26px;
+  }
+  .step {
+    flex: 1;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 14px 14px 14px 16px;
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+    box-shadow: 0 1px 2px rgba(30,27,46,0.04);
+  }
+  .step-icon {
+    width: 34px; height: 34px;
+    border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+    background: var(--icon-bg);
+    color: var(--icon-fg);
+  }
+  .step-num {
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 700;
+    color: var(--violet);
+    margin-bottom: 2px;
+  }
+  .step-title { font-size: 12.5px; font-weight: 700; margin-bottom: 2px; line-height: 1.25; }
+  .step-desc { font-size: 10.5px; color: var(--ink-soft); line-height: 1.35; }
+  .chev {
+    display: flex; align-items: center; justify-content: center;
+    color: #c4bce8;
+    width: 20px; flex-shrink: 0;
+  }
+
+  /* ---- Three-column main section ---- */
+  .grid {
+    display: grid;
+    grid-template-columns: 0.85fr 1.5fr 0.85fr;
+    gap: 16px;
+    align-items: stretch;
+  }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+
+  .panel {
+    border-radius: 16px;
+    padding: 18px;
+    border: 1px solid var(--line);
+    display: flex;
+    flex-direction: column;
+  }
+  .panel-side { background: var(--card); }
+  .panel-center {
+    background: linear-gradient(180deg, #ffffff, #fbfaff);
+    border-color: #ddd6f5;
+  }
+
+  .panel-eyebrow {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    font-weight: 700;
+    margin-bottom: 3px;
+  }
+  .panel-title { font-size: 15px; font-weight: 800; margin-bottom: 14px; line-height: 1.3; }
+
+  .panel-left .panel-eyebrow { color: var(--rose); }
+  .panel-right .panel-eyebrow { color: var(--emerald); }
+  .panel-center .panel-eyebrow { color: var(--violet); text-align: center; }
+  .panel-center .panel-title { text-align: center; }
+
+  .flow-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 9px;
+    padding: 8px 0;
+  }
+  .flow-icon {
+    width: 22px; height: 22px;
+    flex-shrink: 0;
+    color: var(--flow-color, var(--ink-soft));
+    margin-top: 1px;
+  }
+  .flow-label { font-size: 12.5px; font-weight: 700; margin-bottom: 1px; }
+  .flow-desc { font-size: 11px; color: var(--ink-soft); line-height: 1.4; }
+  .flow-divider { height: 14px; margin-left: 11px; border-left: 1.5px dashed #d8d2f0; }
+
+  .panel-callout {
+    margin-top: auto;
+    padding-top: 12px;
+    border-top: 1px solid var(--line);
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1.5;
+  }
+  .panel-left .panel-callout { color: var(--rose); }
+  .panel-right .panel-callout { color: var(--emerald); }
+
+  /* center architecture mini-diagram */
+  .arch-stage {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 9px 12px;
+    margin-bottom: 8px;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+  }
+  .arch-stage .dot { width: 7px; height: 7px; border-radius: 999px; flex-shrink: 0; }
+  .arch-stage-title { font-size: 12px; font-weight: 700; }
+  .arch-stage-sub { font-size: 10px; color: var(--ink-soft); font-family: var(--mono); margin-left: auto; }
+  .arch-connector { height: 8px; margin-left: 15px; border-left: 1.5px solid #ddd6f5; }
+
+  .self-heal-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-family: var(--mono);
+    font-size: 9.5px;
+    font-weight: 700;
+    color: var(--amber);
+    background: var(--amber-pale);
+    border-radius: 999px;
+    padding: 2px 8px;
+    margin: 2px 0 8px 15px;
+  }
+
+  .store-row {
+    margin-top: 10px;
+    padding: 10px 12px;
+    background: var(--violet-pale);
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .store-row .store-label { font-size: 11px; font-weight: 700; color: var(--violet-deep); }
+  .store-row .store-sub { font-size: 9.5px; color: var(--violet-deep); opacity: 0.75; font-family: var(--mono); }
+
+  /* ---- Bottom: stats + quote ---- */
+  .bottom {
+    margin-top: 24px;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    padding: 20px 24px;
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 24px;
+    align-items: center;
+  }
+  @media (max-width: 900px) { .bottom { grid-template-columns: 1fr; } }
+
+  .metrics-label {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--violet);
+    font-weight: 700;
+    margin-bottom: 14px;
+  }
+  .metrics {
+    display: flex;
+    gap: 26px;
+    flex-wrap: wrap;
+  }
+  .metric { display: flex; gap: 9px; align-items: flex-start; max-width: 190px; }
+  .metric-icon { color: var(--violet); flex-shrink: 0; margin-top: 1px; }
+  .metric-title { font-size: 12px; font-weight: 700; margin-bottom: 2px; }
+  .metric-desc { font-size: 10.5px; color: var(--ink-soft); line-height: 1.4; }
+
+  .quote {
+    background: var(--violet-deep);
+    color: white;
+    border-radius: 14px;
+    padding: 18px 22px;
+    max-width: 300px;
+  }
+  .quote p {
+    font-size: 14px;
+    font-weight: 600;
+    line-height: 1.5;
+    margin: 0 0 6px;
+    font-style: italic;
+  }
+  .quote span { font-family: var(--mono); font-size: 10px; color: #d8c9ff; }
+
+  footer {
+    text-align: center;
+    margin-top: 24px;
+    font-family: var(--mono);
+    font-size: 10.5px;
+    color: #9c94b8;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>From Manual ETL to <span class="accent">AI-Reviewed Pipelines</span></h1>
+    <p>The 9Gear Pulse loop: describe the goal, let AI build and sandbox-test it, <b>a human reviews before anything real runs.</b></p>
+  </header>
+
+  <div class="steps">
+    <div class="step">
+      <div class="step-icon" style="--icon-bg:var(--violet-pale); --icon-fg:var(--violet)">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+      </div>
+      <div><div class="step-num">01</div><div class="step-title">Describe Intent</div><div class="step-desc">Plain-English goal, no code required</div></div>
+    </div>
+    <div class="chev"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 18l6-6-6-6"/></svg></div>
+    <div class="step">
+      <div class="step-icon" style="--icon-bg:var(--cyan-pale); --icon-fg:var(--cyan)">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/></svg>
+      </div>
+      <div><div class="step-num">02</div><div class="step-title">Introspect</div><div class="step-desc">Schema cached — never sample data</div></div>
+    </div>
+    <div class="chev"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 18l6-6-6-6"/></svg></div>
+    <div class="step">
+      <div class="step-icon" style="--icon-bg:#e0e7ff; --icon-fg:#4338ca">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><path d="M12 7v4"/><path d="M8 16h.01M16 16h.01"/></svg>
+      </div>
+      <div><div class="step-num">03</div><div class="step-title">Generate</div><div class="step-desc">Claude Sonnet 5, GPT-4o fallback</div></div>
+    </div>
+    <div class="chev"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 18l6-6-6-6"/></svg></div>
+    <div class="step">
+      <div class="step-icon" style="--icon-bg:var(--amber-pale); --icon-fg:var(--amber)">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 2l4 4-4 4"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><path d="M7 22l-4-4 4-4"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>
+      </div>
+      <div><div class="step-num">04</div><div class="step-title">Sandbox &amp; Heal</div><div class="step-desc">Docker test, self-heal up to 3x</div></div>
+    </div>
+    <div class="chev"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 18l6-6-6-6"/></svg></div>
+    <div class="step">
+      <div class="step-icon" style="--icon-bg:var(--violet-pale); --icon-fg:var(--violet)">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12l2 2 4-4"/><path d="M21 12c0 4.97-4.03 9-9 9s-9-4.03-9-9 4.03-9 9-9c1.6 0 3.1.42 4.4 1.15"/></svg>
+      </div>
+      <div><div class="step-num">05</div><div class="step-title">Review</div><div class="step-desc">Human approves, edits, or rejects</div></div>
+    </div>
+    <div class="chev"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 18l6-6-6-6"/></svg></div>
+    <div class="step">
+      <div class="step-icon" style="--icon-bg:var(--emerald-pale); --icon-fg:var(--emerald)">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>
+      </div>
+      <div><div class="step-num">06</div><div class="step-title">Schedule</div><div class="step-desc">Pinned to the approved version</div></div>
+    </div>
+  </div>
+
+  <div class="grid">
+
+    <!-- LEFT: manual ETL -->
+    <div class="panel panel-side panel-left">
+      <div class="panel-eyebrow">Manual ETL</div>
+      <div class="panel-title">Hand-Building Every Pipeline</div>
+
+      <div class="flow-item">
+        <svg class="flow-icon" style="--flow-color:var(--rose)" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 21v-1a8 8 0 0 1 16 0v1"/></svg>
+        <div><div class="flow-label">Engineer</div><div class="flow-desc">Understand the request, translate it by hand</div></div>
+      </div>
+      <div class="flow-divider"></div>
+      <div class="flow-item">
+        <svg class="flow-icon" style="--flow-color:var(--rose)" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+        <div><div class="flow-label">Write extraction code</div><div class="flow-desc">Boilerplate, one script at a time</div></div>
+      </div>
+      <div class="flow-divider"></div>
+      <div class="flow-item">
+        <svg class="flow-icon" style="--flow-color:var(--rose)" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20V10M18 20V4M6 20v-4"/></svg>
+        <div><div class="flow-label">Handle schema drift</div><div class="flow-desc">Manually, whenever a source changes</div></div>
+      </div>
+      <div class="flow-divider"></div>
+      <div class="flow-item">
+        <svg class="flow-icon" style="--flow-color:var(--rose)" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 8v4l3 3"/><circle cx="12" cy="12" r="9"/></svg>
+        <div><div class="flow-label">Deploy &amp; schedule</div><div class="flow-desc">Wire up cron, hope nothing breaks</div></div>
+      </div>
+      <div class="flow-divider"></div>
+      <div class="flow-item">
+        <svg class="flow-icon" style="--flow-color:var(--rose)" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01"/><circle cx="12" cy="12" r="9"/></svg>
+        <div><div class="flow-label">Debug failures</div><div class="flow-desc">By hand, after something's already broken</div></div>
+      </div>
+
+      <div class="panel-callout">Reactive. Manual. Hours per pipeline.</div>
+    </div>
+
+    <!-- CENTER: 9gear pulse architecture -->
+    <div class="panel panel-center">
+      <div class="panel-eyebrow">9gear pulse architecture</div>
+      <div class="panel-title">One Gate, Every Pipeline</div>
+
+      <div class="arch-stage">
+        <span class="dot" style="background:var(--cyan)"></span>
+        <span class="arch-stage-title">Connection Profiles</span>
+        <span class="arch-stage-sub">Fernet-encrypted</span>
+      </div>
+      <div class="arch-connector"></div>
+      <div class="arch-stage">
+        <span class="dot" style="background:#4338ca"></span>
+        <span class="arch-stage-title">Generate</span>
+        <span class="arch-stage-sub">structured output</span>
+      </div>
+      <div class="arch-connector"></div>
+      <div class="arch-stage">
+        <span class="dot" style="background:var(--amber)"></span>
+        <span class="arch-stage-title">Sandbox Test</span>
+        <span class="arch-stage-sub">isolated container</span>
+      </div>
+      <div class="self-heal-badge">
+        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M21 12a9 9 0 1 1-9-9"/><path d="M21 3v6h-6"/></svg>
+        self-heals · max 3 attempts
+      </div>
+      <div class="arch-stage">
+        <span class="dot" style="background:var(--violet)"></span>
+        <span class="arch-stage-title">Review Gate</span>
+        <span class="arch-stage-sub">human approve/reject</span>
+      </div>
+      <div class="arch-connector"></div>
+      <div class="arch-stage">
+        <span class="dot" style="background:var(--emerald)"></span>
+        <span class="arch-stage-title">Schedule</span>
+        <span class="arch-stage-sub">pinned version</span>
+      </div>
+
+      <div class="store-row">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--violet-deep)" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/></svg>
+        <div><div class="store-label">PostgreSQL</div><div class="store-sub">users · pipelines · versions · runs · reviews · audit_log</div></div>
+      </div>
+    </div>
+
+    <!-- RIGHT: AI-reviewed pipelines -->
+    <div class="panel panel-side panel-right">
+      <div class="panel-eyebrow">AI-Reviewed Pipelines</div>
+      <div class="panel-title">Describe, Review, Ship</div>
+
+      <div class="flow-item">
+        <svg class="flow-icon" style="--flow-color:var(--emerald)" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>
+        <div><div class="flow-label">Intent</div><div class="flow-desc">Define the outcome, not the SQL</div></div>
+      </div>
+      <div class="flow-divider"></div>
+      <div class="flow-item">
+        <svg class="flow-icon" style="--flow-color:var(--emerald)" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a10 10 0 1 0 10 10"/><path d="M12 12l6-3"/></svg>
+        <div><div class="flow-label">AI-assisted build</div><div class="flow-desc">AI writes it, tests it in a sandbox</div></div>
+      </div>
+      <div class="flow-divider"></div>
+      <div class="flow-item">
+        <svg class="flow-icon" style="--flow-color:var(--emerald)" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="9"/></svg>
+        <div><div class="flow-label">Human validates</div><div class="flow-desc">Diff, sandbox log, then approve</div></div>
+      </div>
+      <div class="flow-divider"></div>
+      <div class="flow-item">
+        <svg class="flow-icon" style="--flow-color:var(--emerald)" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/></svg>
+        <div><div class="flow-label">Governed</div><div class="flow-desc">Append-only audit trail, always</div></div>
+      </div>
+      <div class="flow-divider"></div>
+      <div class="flow-item">
+        <svg class="flow-icon" style="--flow-color:var(--emerald)" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M18.7 8l-5.1 5.1-2.8-2.8L7 14"/></svg>
+        <div><div class="flow-label">Continuously proven</div><div class="flow-desc">Every run, every version, tracked</div></div>
+      </div>
+
+      <div class="panel-callout">Reviewed. Governed. Minutes per pipeline.</div>
+    </div>
+
+  </div>
+
+  <div class="bottom">
+    <div>
+      <div class="metrics-label">Why this matters — the metrics that decide if this works</div>
+      <div class="metrics">
+        <div class="metric">
+          <svg class="metric-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M9 12l2 2 4-4"/></svg>
+          <div><div class="metric-title">Generation accuracy</div><div class="metric-desc">% approved with zero or minor edits</div></div>
+        </div>
+        <div class="metric">
+          <svg class="metric-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-9-9"/><path d="M21 3v6h-6"/></svg>
+          <div><div class="metric-title">Self-heal rate</div><div class="metric-desc">Errors fixed inside the retry budget</div></div>
+        </div>
+        <div class="metric">
+          <svg class="metric-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>
+          <div><div class="metric-title">Time-to-first pipeline</div><div class="metric-desc">Signup to first approved schedule</div></div>
+        </div>
+        <div class="metric">
+          <svg class="metric-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 14l4-4 3 3 5-6"/></svg>
+          <div><div class="metric-title">30-day retention</div><div class="metric-desc">Approved pipelines still running</div></div>
+        </div>
+      </div>
+    </div>
+    <div class="quote">
+      <p>"Describe the pipeline. Review what it builds. Ship it."</p>
+      <span>9gear pulse — brand positioning</span>
+    </div>
+  </div>
+
+  <footer>built from the PRD, the technical requirements doc, and the actual working system — not a template</footer>
+
+</div>
+</body>
+</html>

@@ -1,7 +1,17 @@
 'use client';
 
 import { FormEvent, useEffect, useState } from 'react';
+import { useAuth } from '@clerk/nextjs';
 import { CheckCircle2, ClipboardCheck, RefreshCw, Send, XCircle } from 'lucide-react';
+
+interface QualityChecks {
+  checked: boolean;
+  reason?: string;
+  dataset?: string;
+  table?: string;
+  row_count?: number;
+  warnings?: string[];
+}
 
 interface Run {
   id: string;
@@ -11,6 +21,7 @@ interface Run {
   log_output: string | null;
   error_output: string | null;
   row_count: number | null;
+  quality_checks: QualityChecks | null;
 }
 
 interface ReviewRecord {
@@ -59,6 +70,7 @@ function getErrorMessage(payload: unknown): string {
 }
 
 export default function ReviewGate({ context }: { context?: { pipelineId: string; actorId: string } }) {
+  const { getToken } = useAuth();
   const [pipelineId, setPipelineId] = useState(() => context?.pipelineId || getSavedContext().pipelineId);
   const [actorId, setActorId] = useState(() => context?.actorId || getSavedContext().actorId);
   const [review, setReview] = useState<ReviewPayload | null>(null);
@@ -91,15 +103,22 @@ export default function ReviewGate({ context }: { context?: { pipelineId: string
 
   const loadReview = async (event?: FormEvent) => {
     event?.preventDefault();
-    if (!pipelineId.trim() || !actorId.trim()) {
-      setMessage('Enter both the pipeline ID and reviewer ID.');
+    if (!pipelineId.trim()) {
+      setMessage('Enter the pipeline ID.');
       return;
     }
     setBusy(true);
     setMessage(null);
     try {
+      const token = await getToken();
+      if (!token) {
+        setMessage('You need to be signed in to load a review.');
+        setBusy(false);
+        return;
+      }
       const response = await fetch(
-        `${API_BASE_URL}/api/v2/pipelines/${encodeURIComponent(pipelineId.trim())}/review?actor_id=${encodeURIComponent(actorId.trim())}`,
+        `${API_BASE_URL}/api/v2/pipelines/${encodeURIComponent(pipelineId.trim())}/review`,
+        { headers: { Authorization: `Bearer ${token}` } },
       );
       const payload: unknown = await response.json();
       if (!response.ok) throw new Error(getErrorMessage(payload));
@@ -174,7 +193,8 @@ export default function ReviewGate({ context }: { context?: { pipelineId: string
   };
 
   const canReview = review?.version.review_status === 'pending_review';
-  const canSchedule = review?.version.review_status === 'approved';
+  const canSchedule = review?.version.review_status === 'approved' && review?.pipeline.status !== 'scheduled';
+  const alreadyScheduled = review?.pipeline.status === 'scheduled';
 
   return (
     <section className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-xl space-y-5">
@@ -210,7 +230,29 @@ export default function ReviewGate({ context }: { context?: { pipelineId: string
 
         <div className="rounded-lg border border-slate-800 bg-slate-950 p-4">
           <p className="mb-3 text-xs font-semibold uppercase tracking-wide text-slate-400">Sandbox evidence</p>
-          {review.runs.length === 0 ? <p className="text-xs text-amber-400">No sandbox run is recorded for this version.</p> : review.runs.map((run) => <div key={run.id} className="border-t border-slate-800 py-3 first:border-t-0 first:pt-0"><p className="text-xs font-semibold text-slate-200">{run.status} {run.row_count !== null ? `· ${run.row_count} rows` : ''}</p><pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap font-mono text-xs text-slate-400">{run.log_output || run.error_output || 'No output recorded.'}</pre></div>)}
+          {review.runs.length === 0 ? <p className="text-xs text-amber-400">No sandbox run is recorded for this version.</p> : review.runs.map((run) => (
+            <div key={run.id} className="border-t border-slate-800 py-3 first:border-t-0 first:pt-0">
+              <p className="text-xs font-semibold text-slate-200">{run.status} {run.row_count !== null ? `· ${run.row_count} rows` : ''}</p>
+              <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap font-mono text-xs text-slate-400">{run.log_output || run.error_output || 'No output recorded.'}</pre>
+              {run.quality_checks?.checked && run.quality_checks.warnings && run.quality_checks.warnings.length > 0 && (
+                <div className="mt-2 rounded-lg border border-amber-800 bg-amber-950/40 p-2.5">
+                  <p className="text-[11px] font-semibold text-amber-400 mb-1">⚠ Data quality warnings — {run.quality_checks.dataset}.{run.quality_checks.table}</p>
+                  <ul className="space-y-0.5">
+                    {run.quality_checks.warnings.map((w, i) => <li key={i} className="text-[11px] text-amber-300">{w}</li>)}
+                  </ul>
+                </div>
+              )}
+              {run.quality_checks?.checked && (!run.quality_checks.warnings || run.quality_checks.warnings.length === 0) && (
+                <p className="mt-2 text-[11px] text-emerald-400">✓ No data quality warnings — {run.quality_checks.dataset}.{run.quality_checks.table}</p>
+              )}
+              {run.quality_checks && !run.quality_checks.checked && (
+                <div className="mt-2 rounded-lg border border-amber-800 bg-amber-950/40 p-2.5">
+                  <p className="text-[11px] font-semibold text-amber-400">⚠ Data quality check could not run</p>
+                  <p className="mt-0.5 text-[11px] text-amber-300">{run.quality_checks.reason}</p>
+                </div>
+              )}
+            </div>
+          ))}
         </div>
 
         <div className="grid gap-4 lg:grid-cols-2">
@@ -231,7 +273,7 @@ export default function ReviewGate({ context }: { context?: { pipelineId: string
 
         <div className="flex flex-col gap-2 rounded-lg border border-slate-800 bg-slate-950 p-4 sm:flex-row sm:items-end">
           <label className="flex-1 text-xs font-semibold text-slate-300">Approved schedule (five-field cron)<input value={cronExpression} onChange={(event) => setCronExpression(event.target.value)} className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 font-mono text-xs text-slate-100 focus:border-violet-500 focus:outline-none" /></label>
-          <button onClick={schedule} disabled={!canSchedule || busy} className="rounded-lg bg-violet-600 px-3 py-2 text-xs font-semibold text-white hover:bg-violet-500 disabled:cursor-not-allowed disabled:bg-slate-700">Schedule approved version</button>
+          <button onClick={schedule} disabled={!canSchedule || busy} className="rounded-lg bg-violet-600 px-3 py-2 text-xs font-semibold text-white hover:bg-violet-500 disabled:cursor-not-allowed disabled:bg-slate-700">{alreadyScheduled ? 'Already scheduled' : 'Schedule approved version'}</button>
         </div>
       </div>}
     </section>

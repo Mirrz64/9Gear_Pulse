@@ -1,10 +1,10 @@
 import os
 import json
-import re
 import docker
 import anthropic
 import openai
 from dotenv import load_dotenv
+from pydantic import BaseModel
 
 from introspect import get_db_url
 
@@ -16,6 +16,13 @@ openai_key = os.getenv("OPENAI_API_KEY")
 
 anthropic_client = anthropic.Anthropic(api_key=anthropic_key) if anthropic_key else None
 openai_client = openai.OpenAI(api_key=openai_key) if openai_key else None
+
+
+class HealedPipeline(BaseModel):
+    fixed_code: str
+    root_cause: str
+    changes_made: str
+
 
 HEALER_SYSTEM_PROMPT = """You are an expert Python data engineering agent specializing in `dlt` and database pipelines.
 You are given a broken Python ETL script, schema metadata of the source database, and the runtime error/traceback produced when executing it inside a Docker container.
@@ -39,14 +46,6 @@ Your job is to fix the code so that it executes without errors.
   "changes_made": "summary of fixes applied"
 }
 """
-
-def clean_json_response(raw_text: str) -> str:
-    text = raw_text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\n?", "", text, flags=re.IGNORECASE)
-        text = re.sub(r"\n?```$", "", text)
-    return text.strip()
-
 
 def _resolve_sandbox_db_urls(script_dir: str, source_db_url: str = None, dest_db_url: str = None):
     """The sandbox container is fully isolated: it can't reach 'localhost'
@@ -132,7 +131,7 @@ def run_in_sandbox(script_path: str, source_db_url: str = None, dest_db_url: str
 
 def heal_script(broken_code: str, error_log: str, schema_summary: dict = None) -> str:
     """Attempts code repair using Anthropic Claude first, falling back to OpenAI GPT-4o on error."""
-    
+
     # default=str handles datetime/non-serializable objects cleanly
     user_prompt = json.dumps({
         "broken_code": broken_code,
@@ -140,49 +139,52 @@ def heal_script(broken_code: str, error_log: str, schema_summary: dict = None) -
         "schema_summary": schema_summary or {}
     }, default=str)
 
-    # Primary Attempt: Anthropic Claude Sonnet 5
+    # Primary Attempt: Anthropic Claude Sonnet 5, via native structured outputs.
     if anthropic_client:
         try:
             print("[Self-Healer] Contacting Primary AI Provider: Anthropic (Claude Sonnet 5)...")
-            response = anthropic_client.messages.create(
+            response = anthropic_client.messages.parse(
                 model="claude-sonnet-5",
-                max_tokens=4000,
+                max_tokens=16000,
+                thinking={"type": "disabled"},
                 system=HEALER_SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": user_prompt}],
+                output_format=HealedPipeline,
             )
-
-            text_blocks = [
-                block.text for block in response.content 
-                if getattr(block, "type", None) == "text" or hasattr(block, "text")
-            ]
-            if text_blocks:
-                cleaned = clean_json_response(text_blocks[0])
-                parsed = json.loads(cleaned)
-                print(f"[Healer Diagnosis (Anthropic)]: {parsed.get('root_cause', 'N/A')}")
-                print(f"[Changes Applied]: {parsed.get('changes_made', 'N/A')}\n")
-                return parsed["fixed_code"]
+            parsed = response.parsed_output
+            if parsed is None:
+                raise RuntimeError(
+                    f"Claude did not return a complete structured response "
+                    f"(stop_reason={getattr(response, 'stop_reason', 'unknown')})."
+                )
+            print(f"[Healer Diagnosis (Anthropic)]: {parsed.root_cause}")
+            print(f"[Changes Applied]: {parsed.changes_made}\n")
+            return parsed.fixed_code
 
         except Exception as e:
             print(f"[Warning] Anthropic API failed or encountered error: {e}")
             print("[Self-Healer] Switching over to Fallback AI Provider: OpenAI (GPT-4o)...")
 
-    # Fallback Attempt: OpenAI GPT-4o
+    # Fallback Attempt: OpenAI GPT-4o, via its own native structured outputs.
     if openai_client:
         try:
-            response = openai_client.chat.completions.create(
+            response = openai_client.beta.chat.completions.parse(
                 model="gpt-4o",
-                response_format={"type": "json_object"},
+                response_format=HealedPipeline,
                 messages=[
                     {"role": "system", "content": HEALER_SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt}
                 ]
             )
-
-            cleaned = clean_json_response(response.choices[0].message.content)
-            parsed = json.loads(cleaned)
-            print(f"[Healer Diagnosis (OpenAI Fallback)]: {parsed.get('root_cause', 'N/A')}")
-            print(f"[Changes Applied]: {parsed.get('changes_made', 'N/A')}\n")
-            return parsed["fixed_code"]
+            parsed = response.choices[0].message.parsed
+            if parsed is None:
+                raise RuntimeError(
+                    response.choices[0].message.refusal
+                    or "OpenAI declined to produce a structured response."
+                )
+            print(f"[Healer Diagnosis (OpenAI Fallback)]: {parsed.root_cause}")
+            print(f"[Changes Applied]: {parsed.changes_made}\n")
+            return parsed.fixed_code
 
         except Exception as e:
             raise RuntimeError(f"OpenAI fallback execution failed: {e}")

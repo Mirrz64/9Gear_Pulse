@@ -18,6 +18,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from auth import get_current_user
+
 from models import (
     AuditLog,
     ConnectionProfile,
@@ -35,7 +37,7 @@ from models import (
     User,
 )
 from session import get_db
-from connection_service import decrypt_credentials, postgres_url
+from connection_service import CredentialResolutionError, decrypt_credentials, postgres_url, validate_credentials_shape
 from introspect import introspect_schema
 from schedule_service import register_schedule
 
@@ -189,8 +191,12 @@ def list_connection_profiles(actor_id: uuid.UUID, db: Session = Depends(get_db))
 @router.post("/connection-profiles", status_code=status.HTTP_201_CREATED)
 def create_connection_profile(body: CreateConnectionProfileRequest, db: Session = Depends(get_db)):
     _require_actor(db, body.actor_id)
-    cipher = _credential_cipher()
-    encrypted_credentials = cipher.encrypt(json.dumps(body.credentials).encode("utf-8"))
+    try:
+        validate_credentials_shape(body.type, body.credentials)
+        cipher = _credential_cipher()
+        encrypted_credentials = cipher.encrypt(json.dumps(body.credentials).encode("utf-8"))
+    except CredentialResolutionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     profile = ConnectionProfile(owner_id=body.actor_id, name=body.name.strip(), type=body.type,
                                 encrypted_credentials=encrypted_credentials)
     db.add(profile)
@@ -209,12 +215,43 @@ def introspect_connection_profile(profile_id: uuid.UUID, body: ActorRequest, db:
         raise HTTPException(status_code=404, detail="Connection profile not found")
     if profile.type != ConnectionType.postgres:
         raise HTTPException(status_code=422, detail="Only Postgres connection profiles are supported in v1")
-    schema = introspect_schema(db_url=postgres_url(profile), sample_rows=0)
+    try:
+        schema = introspect_schema(db_url=postgres_url(profile), sample_rows=0)
+    except CredentialResolutionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     profile.schema_metadata_json = schema
     profile.last_introspected_at = datetime.now(timezone.utc)
     _audit(db, body.actor_id, "connection.introspected", "connection_profile", profile.id)
     db.commit()
     return {"connection_profile_id": profile.id, "schema": schema}
+
+
+@router.delete("/connection-profiles/{profile_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_connection_profile(profile_id: uuid.UUID, actor_id: uuid.UUID, db: Session = Depends(get_db)):
+    _require_actor(db, actor_id)
+    profile = db.scalar(select(ConnectionProfile).where(
+        ConnectionProfile.id == profile_id, ConnectionProfile.owner_id == actor_id
+    ))
+    if profile is None:
+        raise HTTPException(status_code=404, detail="Connection profile not found")
+    # A profile referenced by any pipeline (past or present) can't be
+    # deleted outright - that FK is load-bearing for audit/review history.
+    # Refuse cleanly rather than letting the database raise an
+    # IntegrityError that would surface as an unhandled 500.
+    in_use = db.scalar(
+        select(Pipeline.id).where(
+            (Pipeline.source_connection_id == profile_id) | (Pipeline.destination_connection_id == profile_id)
+        ).limit(1)
+    )
+    if in_use is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="This connection profile is used by an existing pipeline and can't be deleted.",
+        )
+    _audit(db, actor_id, "connection.deleted", "connection_profile", profile.id)
+    db.delete(profile)
+    db.commit()
+    return None
 
 
 @router.post("/pipelines", status_code=status.HTTP_201_CREATED)
@@ -298,19 +335,55 @@ def generate_and_test_pipeline(pipeline_id: uuid.UUID, body: GenerateRequest, db
     pipeline.status = PipelineStatus.testing
     db.add(version)
     db.flush()
-    source_url, destination_url = postgres_url(source), postgres_url(destination)
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", encoding="utf-8", delete=False) as script:
-        script.write(code)
-        script_path = script.name
+
+    started_at = datetime.now(timezone.utc)
     try:
-        from heal_pipeline import execute_with_self_healing
-        success, attempts, logs = execute_with_self_healing(script_path, source.schema_metadata_json, body.max_retries, source_url, destination_url)
-    finally:
-        os.unlink(script_path)
+        source_url, destination_url = postgres_url(source), postgres_url(destination)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", encoding="utf-8", delete=False) as script:
+            script.write(code)
+            script_path = script.name
+        try:
+            from heal_pipeline import execute_with_self_healing
+            success, attempts, logs = execute_with_self_healing(
+                script_path, source.schema_metadata_json, body.max_retries, source_url, destination_url
+            )
+        finally:
+            os.unlink(script_path)
+    except CredentialResolutionError as exc:
+        success, attempts = False, 0
+        logs = f"Could not resolve connection credentials: {exc}"
+    except Exception as exc:
+        # execute_with_self_healing can raise rather than returning a
+        # (False, ...) result like a normal sandbox failure - e.g.
+        # heal_script's "Neither Anthropic nor OpenAI execution
+        # succeeded" when both AI providers fail during a self-heal
+        # attempt. Treat it the same as any other failed test rather
+        # than letting the whole request crash with an unhandled 500.
+        success, attempts = False, 0
+        logs = f"Unexpected error during sandbox test: {exc}"
+
+    quality_result = None
+    row_count = None
+    if success:
+        try:
+            from data_quality import run_quality_checks
+            quality_result = run_quality_checks(
+                destination_url,
+                generated.get("destination_dataset", ""),
+                generated.get("destination_table", ""),
+            )
+            row_count = quality_result.get("row_count")
+        except Exception as exc:
+            # Quality checks are informational, never load-bearing - a
+            # failure here (e.g. a transient connection issue) shouldn't
+            # take down an otherwise-successful test run.
+            quality_result = {"checked": False, "reason": f"Quality check itself failed: {exc}"}
+
     run = PipelineRun(pipeline_id=pipeline.id, pipeline_version_id=version.id,
                       status=RunStatus.success if success else RunStatus.failed,
-                      started_at=datetime.now(timezone.utc), finished_at=datetime.now(timezone.utc),
-                      log_output=logs if success else None, error_output=None if success else logs)
+                      started_at=started_at, finished_at=datetime.now(timezone.utc),
+                      log_output=logs if success else None, error_output=None if success else logs,
+                      row_count=row_count, quality_checks=quality_result)
     db.add(run)
     version.review_status = PipelineVersionReviewStatus.pending_review if success else PipelineVersionReviewStatus.testing
     _audit(db, body.actor_id, "pipeline_version.ready_for_review" if success else "pipeline_version.test_failed", "pipeline_version", version.id)
@@ -320,8 +393,8 @@ def generate_and_test_pipeline(pipeline_id: uuid.UUID, body: GenerateRequest, db
 
 
 @router.get("/pipelines/{pipeline_id}/review")
-def get_review(pipeline_id: uuid.UUID, actor_id: uuid.UUID, db: Session = Depends(get_db)):
-    pipeline = _owned_pipeline(db, pipeline_id, actor_id)
+def get_review(pipeline_id: uuid.UUID, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    pipeline = _owned_pipeline(db, pipeline_id, current_user.id)
     versions = list(db.scalars(
         select(PipelineVersion).where(PipelineVersion.pipeline_id == pipeline.id).order_by(PipelineVersion.version.desc())
     ))
@@ -346,7 +419,8 @@ def get_review(pipeline_id: uuid.UUID, actor_id: uuid.UUID, db: Session = Depend
         },
         "runs": [{"id": run.id, "status": run.status, "started_at": run.started_at,
                   "finished_at": run.finished_at, "log_output": run.log_output,
-                  "error_output": run.error_output, "row_count": run.row_count} for run in runs],
+                  "error_output": run.error_output, "row_count": run.row_count,
+                  "quality_checks": run.quality_checks} for run in runs],
         "review_history": [{"id": review.id, "actor_id": review.actor_id, "action": review.action,
                             "comment": review.comment, "created_at": review.created_at} for review in reviews],
     }

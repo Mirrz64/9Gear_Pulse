@@ -47,6 +47,14 @@ app.add_middleware(
 if os.environ.get("DATABASE_URL", "").startswith("postgresql"):
     from review_api import router as review_router
     app.include_router(review_router)
+    # Same reasoning as review_router: the users table with
+    # auth_provider_id only exists in the commercial Postgres schema, not
+    # whatever the legacy SQLite prototype has - so this stays gated the
+    # same way, not registered unconditionally. Webhooks are server-to-
+    # server (Clerk/Svix calling this endpoint directly), so no CORS
+    # changes are needed for it - CORS only governs browser requests.
+    from clerk_webhooks import router as clerk_webhook_router
+    app.include_router(clerk_webhook_router)
 
 class PipelineRequest(BaseModel):
     goal: str
@@ -97,12 +105,6 @@ def get_generated_code():
 @app.post("/api/run")
 def trigger_pipeline(payload: PipelineRequest):
     """Triggers schema introspection, pipeline generation, Docker sandboxing, and audit logging."""
-    # Previously had no try/except at all, so an unhandled exception (e.g.
-    # Docker not running) escaped as Starlette's default plain-text 500
-    # response instead of JSON - the frontend's `await res.json()` then
-    # throws on that non-JSON body and lands in its catch block, showing
-    # the generic "Failed to connect to FastAPI backend" even when the
-    # backend was reachable and the real cause was something else.
     try:
         success = run_end_to_end_pipeline(goal=payload.goal, max_retries=payload.max_retries)
     except Exception as e:
@@ -192,8 +194,5 @@ def delete_schedule(job_id: str):
 
 
 if __name__ == "__main__":
-    # Neither app.py nor main.py previously called uvicorn.run() anywhere —
-    # the only thing that actually started a server was the Dockerfile's
-    # `uvicorn app:app` CMD. This lets `python app.py` work too.
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

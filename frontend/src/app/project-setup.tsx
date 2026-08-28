@@ -13,7 +13,7 @@ async function request(path: string, method: string, body?: object) {
   return data as Record<string, unknown>;
 }
 
-export default function ProjectSetup({ onPipelineCreated }: { onPipelineCreated: (pipelineId: string, actorId: string) => void }) {
+export default function ProjectSetup({ onPipelineCreated, onActorReady }: { onPipelineCreated: (pipelineId: string, actorId: string) => void; onActorReady?: (actorId: string) => void }) {
   const [actorId, setActorId] = useState(''); const [email, setEmail] = useState('');
   const [profiles, setProfiles] = useState<Item[]>([]); const [projects, setProjects] = useState<Item[]>([]);
   const [name, setName] = useState(''); const [credentials, setCredentials] = useState('{\n  "database_url": "postgresql://user:password@host:5432/database"\n}');
@@ -22,7 +22,7 @@ export default function ProjectSetup({ onPipelineCreated }: { onPipelineCreated:
   const [message, setMessage] = useState(''); const [busy, setBusy] = useState(false);
   const refresh = async (id = actorId) => { const [p, c] = await Promise.all([request(`/api/v2/projects?actor_id=${id}`, 'GET'), request(`/api/v2/connection-profiles?actor_id=${id}`, 'GET')]); setProjects(p.projects as Item[]); setProfiles(c.connection_profiles as Item[]); };
   const action = async (work: () => Promise<void>) => { setBusy(true); setMessage(''); try { await work(); } catch (e) { setMessage(e instanceof Error ? e.message : 'Request failed'); } finally { setBusy(false); } };
-  const createUser = (e: FormEvent) => { e.preventDefault(); void action(async () => { const data = await request('/api/v2/users', 'POST', { email, auth_provider_id: `dev:${email}` }); const id = String(data.id); setActorId(id); await refresh(id); setMessage('Workspace ready. Create two connection profiles (source and destination).'); }); };
+  const createUser = (e: FormEvent) => { e.preventDefault(); void action(async () => { const data = await request('/api/v2/users', 'POST', { email, auth_provider_id: `dev:${email}` }); const id = String(data.id); setActorId(id); onActorReady?.(id); await refresh(id); setMessage('Workspace ready. Create two connection profiles (source and destination).'); }); };
   const createProfile = (e: FormEvent) => { e.preventDefault(); void action(async () => { const parsed = JSON.parse(credentials) as object; await request('/api/v2/connection-profiles', 'POST', { actor_id: actorId, name, type: 'postgres', credentials: parsed }); setName(''); await refresh(); setMessage('Connection profile encrypted and saved.'); }); };
   const createProject = (e: FormEvent) => { e.preventDefault(); void action(async () => { const data = await request('/api/v2/projects', 'POST', { actor_id: actorId, name: projectName, goal_description: goal }); setProjectId(String(data.id)); setProjectName(''); await refresh(); setMessage('Project created. Select it below and create a draft pipeline.'); }); };
   const createPipeline = (e: FormEvent) => { e.preventDefault(); void action(async () => { const data = await request('/api/v2/pipelines', 'POST', { actor_id: actorId, project_id: projectId, source_connection_id: sourceId, destination_connection_id: destinationId, generated_code: '# Draft pipeline. Generate and sandbox-test this version before approval.\n' }); onPipelineCreated(String(data.pipeline_id), actorId); setMessage('Draft created and loaded into the review gate. Introspect the source, then generate and test it.'); }); };

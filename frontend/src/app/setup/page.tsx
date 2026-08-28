@@ -2,9 +2,11 @@
 
 import { useState } from 'react';
 import ProjectSetup from '../project-setup';
+import ConnectionProfiles from '../connection-profiles';
 import ReviewGate from '../review-gate';
 
 export default function SetupPage() {
+  const [actorId, setActorId] = useState('');
   const [pipelineContext, setPipelineContext] = useState<
     { pipelineId: string; actorId: string } | undefined
   >(undefined);
@@ -20,8 +22,11 @@ export default function SetupPage() {
         </header>
 
         <ProjectSetup
-          onPipelineCreated={(pipelineId, actorId) => setPipelineContext({ pipelineId, actorId })}
+          onActorReady={setActorId}
+          onPipelineCreated={(pipelineId, id) => setPipelineContext({ pipelineId, actorId: id })}
         />
+
+        {actorId && <ConnectionProfiles actorId={actorId} />}
 
         <ReviewGate context={pipelineContext} />
       </div>

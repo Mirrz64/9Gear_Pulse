@@ -265,6 +265,12 @@ class PipelineRun(Base):
     log_output: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     error_output: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     row_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Populated by data_quality.run_quality_checks() after a successful
+    # sandbox run - column-level null rates and any warnings (e.g. a
+    # column that ended up entirely empty despite a "successful" load).
+    # Informational only, never blocks approval - the human reviewer
+    # decides what a warning means, same as the rest of the review gate.
+    quality_checks: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
 
     pipeline: Mapped["Pipeline"] = relationship(back_populates="runs")
     pipeline_version: Mapped[Optional["PipelineVersion"]] = relationship(back_populates="runs")

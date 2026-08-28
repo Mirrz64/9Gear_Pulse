@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>9Gear Pulse — System Architecture</title>
+<style>
+  :root {
+    --bg: #020617;
+    --panel: #0f172a;
+    --panel-2: #0b1220;
+    --border: #1e293b;
+    --border-2: #334155;
+    --text: #e2e8f0;
+    --text-dim: #94a3b8;
+    --text-faint: #64748b;
+    --cyan: #22d3ee;
+    --cyan-dim: #0e7490;
+    --violet: #a78bfa;
+    --violet-dim: #6d28d9;
+    --emerald: #34d399;
+    --emerald-dim: #047857;
+    --rose: #fb7185;
+    --amber: #fbbf24;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    background-image:
+      radial-gradient(circle at 15% 0%, rgba(34,211,238,0.05), transparent 40%),
+      radial-gradient(circle at 85% 30%, rgba(167,139,250,0.05), transparent 40%);
+    color: var(--text);
+    font-family: var(--sans);
+    padding: 48px 24px 80px;
+  }
+
+  .wrap { max-width: 880px; margin: 0 auto; }
+
+  header { margin-bottom: 40px; }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--cyan);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+  .eyebrow::before {
+    content: "";
+    width: 6px; height: 6px;
+    background: var(--cyan);
+    border-radius: 999px;
+    box-shadow: 0 0 8px var(--cyan);
+  }
+
+  h1 {
+    font-size: 30px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    margin: 0 0 8px;
+  }
+  header p {
+    color: var(--text-dim);
+    font-size: 14px;
+    margin: 0;
+    max-width: 60ch;
+    line-height: 1.6;
+  }
+
+  /* legend */
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    margin-top: 20px;
+    padding-top: 20px;
+    border-top: 1px solid var(--border);
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-faint);
+  }
+  .dot { width: 8px; height: 8px; border-radius: 999px; }
+
+  /* connector line between stages */
+  .connector {
+    width: 1px;
+    height: 28px;
+    margin: 0 auto;
+    background: linear-gradient(var(--border-2), var(--border));
+    position: relative;
+  }
+  .connector::after {
+    content: "";
+    position: absolute;
+    bottom: -1px; left: 50%;
+    transform: translateX(-50%);
+    width: 6px; height: 6px;
+    border-right: 1px solid var(--border-2);
+    border-bottom: 1px solid var(--border-2);
+    rotate: 45deg;
+  }
+
+  .stage {
+    border: 1px solid var(--border);
+    background: var(--panel);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+
+  .stage-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel-2);
+  }
+  .stage-num {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--bg);
+    background: var(--accent, var(--cyan));
+    width: 20px; height: 20px;
+    border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700;
+    flex-shrink: 0;
+  }
+  .stage-title { font-weight: 600; font-size: 14.5px; }
+  .stage-sub {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    color: var(--text-faint);
+    margin-left: auto;
+    text-align: right;
+  }
+
+  .stage-body { padding: 16px 18px 18px; }
+  .stage-body p {
+    margin: 0 0 12px;
+    font-size: 13px;
+    color: var(--text-dim);
+    line-height: 1.6;
+  }
+  .stage-body p:last-child { margin-bottom: 0; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 4px 9px;
+    border-radius: 999px;
+    border: 1px solid var(--border-2);
+    background: var(--panel-2);
+    color: var(--text-dim);
+  }
+
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  @media (max-width: 560px) { .split { grid-template-columns: 1fr; } }
+
+  .mini {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    background: var(--panel-2);
+  }
+  .mini-label {
+    font-family: var(--mono);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-faint);
+    margin-bottom: 4px;
+  }
+  .mini-val { font-size: 12.5px; color: var(--text); }
+
+  /* self-healing loop — the signature element */
+  .loop-wrap {
+    position: relative;
+    border: 1px dashed var(--amber);
+    border-radius: 10px;
+    padding: 16px 18px;
+    background: rgba(251,191,36,0.04);
+    margin-top: 14px;
+  }
+  .loop-label {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    color: var(--amber);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    display: flex; align-items: center; gap: 8px;
+    margin-bottom: 10px;
+  }
+  .loop-track {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    font-family: var(--mono);
+    font-size: 11.5px;
+  }
+  .loop-step {
+    padding: 7px 12px;
+    border: 1px solid var(--border-2);
+    border-radius: 7px;
+    background: var(--panel);
+    color: var(--text);
+    white-space: nowrap;
+  }
+  .loop-arrow { color: var(--text-faint); padding: 0 8px; font-size: 13px; }
+  .loop-back {
+    margin-top: 10px;
+    font-size: 11px;
+    color: var(--text-faint);
+    display: flex; align-items: center; gap: 6px;
+  }
+  .loop-back svg { flex-shrink: 0; }
+
+  /* branch fork for approve/reject */
+  .fork {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    margin-top: 12px;
+  }
+  @media (max-width: 560px) { .fork { grid-template-columns: 1fr; } }
+  .fork-item {
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    border: 1px solid;
+  }
+  .fork-approve { border-color: var(--emerald-dim); background: rgba(52,211,153,0.06); color: var(--emerald); }
+  .fork-reject { border-color: #9f1239; background: rgba(251,113,133,0.06); color: var(--rose); }
+
+  /* datastore */
+  .store {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 18px;
+    background: var(--panel);
+  }
+  .store-icon {
+    width: 34px; height: 34px;
+    border-radius: 8px;
+    background: rgba(34,211,238,0.08);
+    border: 1px solid var(--cyan-dim);
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .store-tables {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin-top: 8px;
+  }
+  .table-pill {
+    font-family: var(--mono);
+    font-size: 10px;
+    padding: 3px 7px;
+    border-radius: 4px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text-faint);
+  }
+
+  footer {
+    margin-top: 40px;
+    padding-top: 20px;
+    border-top: 1px solid var(--border);
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-faint);
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="eyebrow">9gear pulse · system architecture</div>
+    <h1>Describe → Generate → Sandbox-Test → Review → Schedule</h1>
+    <p>Every pipeline goes through the same gate: nothing an AI writes ever reaches a real destination without a sandboxed test and a human approval in between.</p>
+
+    <div class="legend">
+      <div class="legend-item"><span class="dot" style="background:var(--cyan)"></span> Setup &amp; connections</div>
+      <div class="legend-item"><span class="dot" style="background:#818cf8"></span> AI generation</div>
+      <div class="legend-item"><span class="dot" style="background:var(--amber)"></span> Sandbox &amp; self-healing</div>
+      <div class="legend-item"><span class="dot" style="background:var(--violet)"></span> Human review gate</div>
+      <div class="legend-item"><span class="dot" style="background:var(--emerald)"></span> Approved &amp; scheduled</div>
+    </div>
+  </header>
+
+  <!-- Stage 0: Client -->
+  <div class="stage">
+    <div class="stage-head">
+      <div class="stage-num" style="--accent:#64748b; color:#e2e8f0">·</div>
+      <div class="stage-title">Client — Next.js frontend</div>
+      <div class="stage-sub">localhost:3000</div>
+    </div>
+    <div class="stage-body">
+      <div class="split">
+        <div class="mini">
+          <div class="mini-label">/ — legacy dashboard</div>
+          <div class="mini-val">Single-connection prototype. Schema browser, one-shot pipeline runner, SQLite-backed.</div>
+        </div>
+        <div class="mini">
+          <div class="mini-label">/setup — review gate</div>
+          <div class="mini-val">Multi-tenant workspace. Connection profiles, projects, generate → review → schedule.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="connector"></div>
+
+  <!-- Stage 1: Connection profiles -->
+  <div class="stage">
+    <div class="stage-head">
+      <div class="stage-num" style="--accent:var(--cyan); color:#020617">1</div>
+      <div class="stage-title">Connection profiles</div>
+      <div class="stage-sub">connection_service.py</div>
+    </div>
+    <div class="stage-body">
+      <p>Credentials encrypted at rest (Fernet, <code style="font-family:var(--mono)">CREDENTIAL_ENCRYPTION_KEY</code>) and never touch the AI. Introspection caches schema shape only — table &amp; column names, no sample rows.</p>
+      <div class="chips">
+        <span class="chip">encrypted_credentials → Postgres</span>
+        <span class="chip">schema_metadata_json cached</span>
+        <span class="chip">Postgres-only, v1</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="connector"></div>
+
+  <!-- Stage 2: Generate -->
+  <div class="stage">
+    <div class="stage-head">
+      <div class="stage-num" style="--accent:#818cf8; color:#020617">2</div>
+      <div class="stage-title">Generate</div>
+      <div class="stage-sub">generate_pipeline.py</div>
+    </div>
+    <div class="stage-body">
+      <p>Goal + cached schema (never credentials) → structured, schema-enforced JSON. Thinking disabled for a predictable token budget; falls back automatically on failure.</p>
+      <div class="split">
+        <div class="mini">
+          <div class="mini-label">Primary</div>
+          <div class="mini-val">Claude Sonnet 5 · <span style="font-family:var(--mono);font-size:11px">messages.parse()</span></div>
+        </div>
+        <div class="mini">
+          <div class="mini-label">Fallback</div>
+          <div class="mini-val">GPT-4o · <span style="font-family:var(--mono);font-size:11px">chat.completions.parse()</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="connector"></div>
+
+  <!-- Stage 3: Sandbox + self-healing (signature) -->
+  <div class="stage">
+    <div class="stage-head">
+      <div class="stage-num" style="--accent:var(--amber); color:#020617">3</div>
+      <div class="stage-title">Sandbox test</div>
+      <div class="stage-sub">heal_pipeline.py</div>
+    </div>
+    <div class="stage-body">
+      <p>Ephemeral <span style="font-family:var(--mono);font-size:12px">python:3.10-slim</span> container. Runs the generated <span style="font-family:var(--mono);font-size:12px">dlt</span> script against the real destination, network-isolated except for the declared source/destination.</p>
+
+      <div class="loop-wrap">
+        <div class="loop-label">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M17 2l4 4-4 4"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><path d="M7 22l-4-4 4-4"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>
+          self-healing loop · bounded, max 3 attempts
+        </div>
+        <div class="loop-track">
+          <span class="loop-step">run</span>
+          <span class="loop-arrow">→</span>
+          <span class="loop-step" style="border-color:#9f1239;color:var(--rose)">fails</span>
+          <span class="loop-arrow">→</span>
+          <span class="loop-step">AI reads traceback</span>
+          <span class="loop-arrow">→</span>
+          <span class="loop-step" style="border-color:var(--emerald-dim);color:var(--emerald)">patches &amp; retries</span>
+        </div>
+        <div class="loop-back">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 9-9"/><path d="M3 4v5h5"/></svg>
+          exhausted → pipeline returns to draft, nothing silently retried forever
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="connector"></div>
+
+  <!-- Stage 4: Review -->
+  <div class="stage">
+    <div class="stage-head">
+      <div class="stage-num" style="--accent:var(--violet); color:#020617">4</div>
+      <div class="stage-title">Human review gate</div>
+      <div class="stage-sub">review_api.py</div>
+    </div>
+    <div class="stage-body">
+      <p>Code diff, sandbox log, and a place for a reviewer's reasoning — the one place in the loop where a person, not a model, makes the call.</p>
+      <div class="fork">
+        <div class="fork-item fork-approve">✓ approve → pinned, schedulable</div>
+        <div class="fork-item fork-reject">✕ reject → comment feeds the next generation attempt</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="connector"></div>
+
+  <!-- Stage 5: Schedule -->
+  <div class="stage">
+    <div class="stage-head">
+      <div class="stage-num" style="--accent:var(--emerald); color:#020617">5</div>
+      <div class="stage-title">Schedule</div>
+      <div class="stage-sub">schedule_service.py · APScheduler</div>
+    </div>
+    <div class="stage-body">
+      <p>Pinned to the exact <span style="font-family:var(--mono);font-size:12px">pipeline_version_id</span> that was reviewed — a later edit can never silently change what an approved schedule actually runs. Restored from Postgres on every backend restart.</p>
+      <div class="chips">
+        <span class="chip">cron_expression</span>
+        <span class="chip">next_run_at persisted</span>
+        <span class="chip">runs pinned code only, never regenerates</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="connector"></div>
+
+  <!-- Data layer -->
+  <div class="store">
+    <div class="store-icon">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#22d3ee" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/></svg>
+    </div>
+    <div>
+      <div class="mini-label" style="margin-bottom:6px">PostgreSQL — commercial schema</div>
+      <div class="store-tables">
+        <span class="table-pill">users</span>
+        <span class="table-pill">projects</span>
+        <span class="table-pill">connection_profiles</span>
+        <span class="table-pill">pipelines</span>
+        <span class="table-pill">pipeline_versions</span>
+        <span class="table-pill">pipeline_runs</span>
+        <span class="table-pill">pipeline_reviews</span>
+        <span class="table-pill">schedules</span>
+        <span class="table-pill">audit_log</span>
+      </div>
+    </div>
+  </div>
+
+  <footer>
+    <span>9gear_pulse · backend: FastAPI + SQLAlchemy · frontend: Next.js</span>
+    <span>generated from the actual working build, not a template</span>
+  </footer>
+
+</div>
+</body>
+</html>

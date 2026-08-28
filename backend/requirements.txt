@@ -27,3 +27,7 @@ cryptography>=44.0.0
 # Utilities
 httpx>=0.28.1
 requests>=2.34.2
+
+# Auth
+clerk-backend-api>=3.1.0
+svix>=1.78.0
