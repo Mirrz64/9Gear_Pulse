@@ -6,10 +6,11 @@ import ConnectionProfiles from '../connection-profiles';
 import ReviewGate from '../review-gate';
 
 export default function SetupPage() {
-  const [actorId, setActorId] = useState('');
-  const [pipelineContext, setPipelineContext] = useState<
-    { pipelineId: string; actorId: string } | undefined
-  >(undefined);
+  // No more actorId gate - that state existed purely to wait for the old
+  // "create workspace" step to finish. A signed-in Clerk user's account
+  // already exists (via the webhook) before this page ever renders, so
+  // there's nothing left to wait for.
+  const [pipelineContext, setPipelineContext] = useState<{ pipelineId: string } | undefined>(undefined);
 
   return (
     <main className="min-h-screen bg-slate-950 text-slate-100 p-8 font-sans">
@@ -21,12 +22,9 @@ export default function SetupPage() {
           </p>
         </header>
 
-        <ProjectSetup
-          onActorReady={setActorId}
-          onPipelineCreated={(pipelineId, id) => setPipelineContext({ pipelineId, actorId: id })}
-        />
+        <ProjectSetup onPipelineCreated={(pipelineId) => setPipelineContext({ pipelineId })} />
 
-        {actorId && <ConnectionProfiles actorId={actorId} />}
+        <ConnectionProfiles />
 
         <ReviewGate context={pipelineContext} />
       </div>

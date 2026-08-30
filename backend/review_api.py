@@ -43,63 +43,57 @@ from schedule_service import register_schedule
 
 router = APIRouter(prefix="/api/v2", tags=["review gate"])
 
-
-class ActorRequest(BaseModel):
-    # Temporary explicit actor until Clerk/Auth0 is wired in. Replace this
-    # field with the authenticated principal in the auth workstream.
-    actor_id: uuid.UUID
-
-
-class CreateUserRequest(BaseModel):
-    email: str = Field(min_length=3, max_length=320)
-    auth_provider_id: str = Field(min_length=1, max_length=255)
+# Every request model below used to inherit an actor_id field from a
+# shared ActorRequest base - that class, and the field, are gone now.
+# The actor is get_current_user's verified result, never something the
+# client's request body gets to assert.
 
 
-class CreateProjectRequest(ActorRequest):
+class CreateProjectRequest(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     goal_description: str = Field(min_length=1)
 
 
-class CreateConnectionProfileRequest(ActorRequest):
+class CreateConnectionProfileRequest(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     type: ConnectionType = ConnectionType.postgres
     credentials: dict[str, Any]
 
 
-class CreatePipelineRequest(ActorRequest):
+class CreatePipelineRequest(BaseModel):
     project_id: uuid.UUID
     source_connection_id: uuid.UUID
     destination_connection_id: uuid.UUID
     generated_code: str = Field(min_length=1)
 
 
-class GenerateRequest(ActorRequest):
+class GenerateRequest(BaseModel):
     max_retries: int = Field(default=3, ge=1, le=3)
 
 
-class TestResultRequest(ActorRequest):
+class TestResultRequest(BaseModel):
     status: RunStatus
     log_output: Optional[str] = None
     error_output: Optional[str] = None
     row_count: Optional[int] = Field(default=None, ge=0)
 
 
-class ReviewRequest(ActorRequest):
+class ReviewRequest(BaseModel):
     comment: Optional[str] = Field(default=None, max_length=10_000)
 
 
-class EditRequest(ActorRequest):
+class EditRequest(BaseModel):
     generated_code: str = Field(min_length=1)
 
 
-class ScheduleRequest(ActorRequest):
+class ScheduleRequest(BaseModel):
     cron_expression: str = Field(min_length=9, max_length=120)
 
 
 def _owned_pipeline(db: Session, pipeline_id: uuid.UUID, actor_id: uuid.UUID, *, lock: bool = False) -> Pipeline:
-    """Temporary ownership authorization used until the auth dependency exists."""
-    if db.get(User, actor_id) is None:
-        raise HTTPException(status_code=401, detail="Unknown review actor")
+    # The "does this actor exist" check that used to live here is gone -
+    # actor_id is always current_user.id now, already a verified, just-
+    # fetched real row. Checking again would be pure overhead.
     statement = (
         select(Pipeline)
         .join(Project)
@@ -111,11 +105,6 @@ def _owned_pipeline(db: Session, pipeline_id: uuid.UUID, actor_id: uuid.UUID, *,
     if pipeline is None:
         raise HTTPException(status_code=404, detail="Pipeline not found")
     return pipeline
-
-
-def _require_actor(db: Session, actor_id: uuid.UUID) -> None:
-    if db.get(User, actor_id) is None:
-        raise HTTPException(status_code=401, detail="Unknown actor")
 
 
 def _credential_cipher() -> Fernet:
@@ -146,42 +135,27 @@ def _audit(db: Session, actor_id: uuid.UUID, action: str, entity_type: str, enti
     db.add(AuditLog(actor_id=actor_id, action=action, entity_type=entity_type, entity_id=entity_id))
 
 
-@router.post("/users", status_code=status.HTTP_201_CREATED)
-def create_user(body: CreateUserRequest, db: Session = Depends(get_db)):
-    existing = db.scalar(select(User).where(User.email == body.email.strip().lower()))
-    if existing:
-        return {"id": existing.id, "email": existing.email}
-    user = User(email=body.email.strip().lower(), auth_provider_id=body.auth_provider_id.strip())
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    return {"id": user.id, "email": user.email}
-
-
 @router.get("/projects")
-def list_projects(actor_id: uuid.UUID, db: Session = Depends(get_db)):
-    _require_actor(db, actor_id)
-    projects = db.scalars(select(Project).where(Project.owner_id == actor_id).order_by(Project.created_at.desc()))
+def list_projects(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    projects = db.scalars(select(Project).where(Project.owner_id == current_user.id).order_by(Project.created_at.desc()))
     return {"projects": [{"id": project.id, "name": project.name, "goal_description": project.goal_description,
                            "status": project.status, "created_at": project.created_at} for project in projects]}
 
 
 @router.post("/projects", status_code=status.HTTP_201_CREATED)
-def create_project(body: CreateProjectRequest, db: Session = Depends(get_db)):
-    _require_actor(db, body.actor_id)
-    project = Project(owner_id=body.actor_id, name=body.name.strip(), goal_description=body.goal_description.strip())
+def create_project(body: CreateProjectRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    project = Project(owner_id=current_user.id, name=body.name.strip(), goal_description=body.goal_description.strip())
     db.add(project)
     db.flush()
-    _audit(db, body.actor_id, "project.created", "project", project.id)
+    _audit(db, current_user.id, "project.created", "project", project.id)
     db.commit()
     db.refresh(project)
     return {"id": project.id, "name": project.name, "goal_description": project.goal_description}
 
 
 @router.get("/connection-profiles")
-def list_connection_profiles(actor_id: uuid.UUID, db: Session = Depends(get_db)):
-    _require_actor(db, actor_id)
-    profiles = db.scalars(select(ConnectionProfile).where(ConnectionProfile.owner_id == actor_id).order_by(ConnectionProfile.created_at.desc()))
+def list_connection_profiles(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    profiles = db.scalars(select(ConnectionProfile).where(ConnectionProfile.owner_id == current_user.id).order_by(ConnectionProfile.created_at.desc()))
     # Never return encrypted_credentials, even to the profile owner.
     return {"connection_profiles": [{"id": profile.id, "name": profile.name, "type": profile.type,
                                       "schema_metadata_json": profile.schema_metadata_json,
@@ -189,28 +163,28 @@ def list_connection_profiles(actor_id: uuid.UUID, db: Session = Depends(get_db))
 
 
 @router.post("/connection-profiles", status_code=status.HTTP_201_CREATED)
-def create_connection_profile(body: CreateConnectionProfileRequest, db: Session = Depends(get_db)):
-    _require_actor(db, body.actor_id)
+def create_connection_profile(body: CreateConnectionProfileRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     try:
         validate_credentials_shape(body.type, body.credentials)
         cipher = _credential_cipher()
         encrypted_credentials = cipher.encrypt(json.dumps(body.credentials).encode("utf-8"))
     except CredentialResolutionError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    profile = ConnectionProfile(owner_id=body.actor_id, name=body.name.strip(), type=body.type,
+    profile = ConnectionProfile(owner_id=current_user.id, name=body.name.strip(), type=body.type,
                                 encrypted_credentials=encrypted_credentials)
     db.add(profile)
     db.flush()
-    _audit(db, body.actor_id, "connection.created", "connection_profile", profile.id)
+    _audit(db, current_user.id, "connection.created", "connection_profile", profile.id)
     db.commit()
     db.refresh(profile)
     return {"id": profile.id, "name": profile.name, "type": profile.type}
 
 
 @router.post("/connection-profiles/{profile_id}/introspect")
-def introspect_connection_profile(profile_id: uuid.UUID, body: ActorRequest, db: Session = Depends(get_db)):
-    _require_actor(db, body.actor_id)
-    profile = db.scalar(select(ConnectionProfile).where(ConnectionProfile.id == profile_id, ConnectionProfile.owner_id == body.actor_id))
+def introspect_connection_profile(profile_id: uuid.UUID, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    # No request body needed anymore - it used to exist purely to carry
+    # actor_id, which is now the verified session instead.
+    profile = db.scalar(select(ConnectionProfile).where(ConnectionProfile.id == profile_id, ConnectionProfile.owner_id == current_user.id))
     if profile is None:
         raise HTTPException(status_code=404, detail="Connection profile not found")
     if profile.type != ConnectionType.postgres:
@@ -221,16 +195,15 @@ def introspect_connection_profile(profile_id: uuid.UUID, body: ActorRequest, db:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     profile.schema_metadata_json = schema
     profile.last_introspected_at = datetime.now(timezone.utc)
-    _audit(db, body.actor_id, "connection.introspected", "connection_profile", profile.id)
+    _audit(db, current_user.id, "connection.introspected", "connection_profile", profile.id)
     db.commit()
     return {"connection_profile_id": profile.id, "schema": schema}
 
 
 @router.delete("/connection-profiles/{profile_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_connection_profile(profile_id: uuid.UUID, actor_id: uuid.UUID, db: Session = Depends(get_db)):
-    _require_actor(db, actor_id)
+def delete_connection_profile(profile_id: uuid.UUID, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     profile = db.scalar(select(ConnectionProfile).where(
-        ConnectionProfile.id == profile_id, ConnectionProfile.owner_id == actor_id
+        ConnectionProfile.id == profile_id, ConnectionProfile.owner_id == current_user.id
     ))
     if profile is None:
         raise HTTPException(status_code=404, detail="Connection profile not found")
@@ -248,23 +221,22 @@ def delete_connection_profile(profile_id: uuid.UUID, actor_id: uuid.UUID, db: Se
             status_code=409,
             detail="This connection profile is used by an existing pipeline and can't be deleted.",
         )
-    _audit(db, actor_id, "connection.deleted", "connection_profile", profile.id)
+    _audit(db, current_user.id, "connection.deleted", "connection_profile", profile.id)
     db.delete(profile)
     db.commit()
     return None
 
 
 @router.post("/pipelines", status_code=status.HTTP_201_CREATED)
-def create_pipeline(body: CreatePipelineRequest, db: Session = Depends(get_db)):
-    _require_actor(db, body.actor_id)
+def create_pipeline(body: CreatePipelineRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     if body.source_connection_id == body.destination_connection_id:
         raise HTTPException(status_code=422, detail="Source and destination connection profiles must differ")
-    project = db.scalar(select(Project).where(Project.id == body.project_id, Project.owner_id == body.actor_id))
+    project = db.scalar(select(Project).where(Project.id == body.project_id, Project.owner_id == current_user.id))
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
     profiles = list(db.scalars(select(ConnectionProfile.id).where(
         ConnectionProfile.id.in_([body.source_connection_id, body.destination_connection_id]),
-        ConnectionProfile.owner_id == body.actor_id,
+        ConnectionProfile.owner_id == current_user.id,
     )))
     if len(profiles) != 2:
         raise HTTPException(status_code=404, detail="One or both connection profiles were not found")
@@ -274,18 +246,18 @@ def create_pipeline(body: CreatePipelineRequest, db: Session = Depends(get_db)):
     db.add(pipeline)
     db.flush()
     version = PipelineVersion(pipeline_id=pipeline.id, version=1, generated_code=body.generated_code,
-                              created_by=body.actor_id, review_status=PipelineVersionReviewStatus.draft)
+                              created_by=current_user.id, review_status=PipelineVersionReviewStatus.draft)
     db.add(version)
-    _audit(db, body.actor_id, "pipeline.created", "pipeline", pipeline.id)
+    _audit(db, current_user.id, "pipeline.created", "pipeline", pipeline.id)
     db.commit()
     db.refresh(pipeline)
     return {"pipeline_id": pipeline.id, "version_id": version.id, "status": pipeline.status}
 
 
 @router.post("/pipelines/{pipeline_id}/generate")
-def generate_and_test_pipeline(pipeline_id: uuid.UUID, body: GenerateRequest, db: Session = Depends(get_db)):
+def generate_and_test_pipeline(pipeline_id: uuid.UUID, body: GenerateRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Generate code from cached source schema, sandbox it, and persist evidence."""
-    pipeline = _owned_pipeline(db, pipeline_id, body.actor_id, lock=True)
+    pipeline = _owned_pipeline(db, pipeline_id, current_user.id, lock=True)
     source = db.get(ConnectionProfile, pipeline.source_connection_id)
     destination = db.get(ConnectionProfile, pipeline.destination_connection_id)
     if source is None or destination is None:
@@ -324,12 +296,12 @@ def generate_and_test_pipeline(pipeline_id: uuid.UUID, body: GenerateRequest, db
         if not code:
             raise ValueError("AI response did not include pipeline code")
     except Exception as exc:
-        _audit(db, body.actor_id, "pipeline.generation_failed", "pipeline", pipeline.id)
+        _audit(db, current_user.id, "pipeline.generation_failed", "pipeline", pipeline.id)
         db.commit()
         raise HTTPException(status_code=502, detail=f"Pipeline generation failed: {exc}") from exc
     version_number = pipeline.version + 1
     version = PipelineVersion(pipeline_id=pipeline.id, version=version_number, generated_code=code,
-                              created_by=body.actor_id, review_status=PipelineVersionReviewStatus.testing)
+                              created_by=current_user.id, review_status=PipelineVersionReviewStatus.testing)
     pipeline.version = version_number
     pipeline.generated_code = code
     pipeline.status = PipelineStatus.testing
@@ -386,7 +358,7 @@ def generate_and_test_pipeline(pipeline_id: uuid.UUID, body: GenerateRequest, db
                       row_count=row_count, quality_checks=quality_result)
     db.add(run)
     version.review_status = PipelineVersionReviewStatus.pending_review if success else PipelineVersionReviewStatus.testing
-    _audit(db, body.actor_id, "pipeline_version.ready_for_review" if success else "pipeline_version.test_failed", "pipeline_version", version.id)
+    _audit(db, current_user.id, "pipeline_version.ready_for_review" if success else "pipeline_version.test_failed", "pipeline_version", version.id)
     db.commit()
     return {"pipeline_id": pipeline.id, "version_id": version.id, "attempts": attempts,
             "review_status": version.review_status, "sandbox_success": success}
@@ -427,11 +399,11 @@ def get_review(pipeline_id: uuid.UUID, db: Session = Depends(get_db), current_us
 
 
 @router.post("/pipeline-versions/{version_id}/test-result", status_code=status.HTTP_201_CREATED)
-def record_test_result(version_id: uuid.UUID, body: TestResultRequest, db: Session = Depends(get_db)):
-    version = _owned_version(db, version_id, body.actor_id, lock=True)
+def record_test_result(version_id: uuid.UUID, body: TestResultRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    version = _owned_version(db, version_id, current_user.id, lock=True)
     if version.review_status in {PipelineVersionReviewStatus.approved, PipelineVersionReviewStatus.rejected}:
         raise HTTPException(status_code=409, detail="Finalized versions cannot receive new test results")
-    pipeline = _owned_pipeline(db, version.pipeline_id, body.actor_id, lock=True)
+    pipeline = _owned_pipeline(db, version.pipeline_id, current_user.id, lock=True)
     version.review_status = PipelineVersionReviewStatus.testing
     pipeline.status = PipelineStatus.testing
     run = PipelineRun(
@@ -442,18 +414,18 @@ def record_test_result(version_id: uuid.UUID, body: TestResultRequest, db: Sessi
     db.add(run)
     if body.status == RunStatus.success:
         version.review_status = PipelineVersionReviewStatus.pending_review
-        _audit(db, body.actor_id, "pipeline_version.ready_for_review", "pipeline_version", version.id)
+        _audit(db, current_user.id, "pipeline_version.ready_for_review", "pipeline_version", version.id)
     else:
-        _audit(db, body.actor_id, "pipeline_version.test_failed", "pipeline_version", version.id)
+        _audit(db, current_user.id, "pipeline_version.test_failed", "pipeline_version", version.id)
     db.commit()
     db.refresh(run)
     return {"run_id": run.id, "review_status": version.review_status}
 
 
 @router.post("/pipeline-versions/{version_id}/approve")
-def approve(version_id: uuid.UUID, body: ReviewRequest, db: Session = Depends(get_db)):
-    version = _owned_version(db, version_id, body.actor_id, lock=True)
-    pipeline = _owned_pipeline(db, version.pipeline_id, body.actor_id, lock=True)
+def approve(version_id: uuid.UUID, body: ReviewRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    version = _owned_version(db, version_id, current_user.id, lock=True)
+    pipeline = _owned_pipeline(db, version.pipeline_id, current_user.id, lock=True)
     successful_run = db.scalar(select(PipelineRun.id).where(
         PipelineRun.pipeline_version_id == version.id, PipelineRun.status == RunStatus.success
     ))
@@ -462,54 +434,54 @@ def approve(version_id: uuid.UUID, body: ReviewRequest, db: Session = Depends(ge
     if version.review_status != PipelineVersionReviewStatus.pending_review or successful_run is None:
         raise HTTPException(status_code=409, detail="A successful sandbox test is required before approval")
     version.review_status = PipelineVersionReviewStatus.approved
-    version.reviewed_by = body.actor_id
+    version.reviewed_by = current_user.id
     version.reviewed_at = datetime.now(timezone.utc)
     pipeline.status = PipelineStatus.approved
-    db.add(PipelineReview(pipeline_version_id=version.id, actor_id=body.actor_id,
+    db.add(PipelineReview(pipeline_version_id=version.id, actor_id=current_user.id,
                           action=PipelineReviewAction.approved, comment=body.comment))
-    _audit(db, body.actor_id, "pipeline.approved", "pipeline_version", version.id)
+    _audit(db, current_user.id, "pipeline.approved", "pipeline_version", version.id)
     db.commit()
     return {"pipeline_id": pipeline.id, "version_id": version.id, "status": "approved"}
 
 
 @router.post("/pipeline-versions/{version_id}/reject")
-def reject(version_id: uuid.UUID, body: ReviewRequest, db: Session = Depends(get_db)):
-    version = _owned_version(db, version_id, body.actor_id, lock=True)
+def reject(version_id: uuid.UUID, body: ReviewRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    version = _owned_version(db, version_id, current_user.id, lock=True)
     if version.review_status != PipelineVersionReviewStatus.pending_review:
         raise HTTPException(status_code=409, detail="Only a version awaiting review can be rejected")
     version.review_status = PipelineVersionReviewStatus.rejected
-    version.reviewed_by = body.actor_id
+    version.reviewed_by = current_user.id
     version.reviewed_at = datetime.now(timezone.utc)
-    db.add(PipelineReview(pipeline_version_id=version.id, actor_id=body.actor_id,
+    db.add(PipelineReview(pipeline_version_id=version.id, actor_id=current_user.id,
                           action=PipelineReviewAction.rejected, comment=body.comment))
-    _audit(db, body.actor_id, "pipeline.rejected", "pipeline_version", version.id)
+    _audit(db, current_user.id, "pipeline.rejected", "pipeline_version", version.id)
     db.commit()
     return {"version_id": version.id, "status": "rejected"}
 
 
 @router.post("/pipelines/{pipeline_id}/versions", status_code=status.HTTP_201_CREATED)
-def edit_pipeline(pipeline_id: uuid.UUID, body: EditRequest, db: Session = Depends(get_db)):
-    pipeline = _owned_pipeline(db, pipeline_id, body.actor_id, lock=True)
+def edit_pipeline(pipeline_id: uuid.UUID, body: EditRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    pipeline = _owned_pipeline(db, pipeline_id, current_user.id, lock=True)
     next_version = pipeline.version + 1
     version = PipelineVersion(pipeline_id=pipeline.id, version=next_version,
-                              generated_code=body.generated_code, created_by=body.actor_id)
+                              generated_code=body.generated_code, created_by=current_user.id)
     pipeline.version = next_version
     pipeline.generated_code = body.generated_code
     pipeline.status = PipelineStatus.draft
     db.add(version)
-    _audit(db, body.actor_id, "pipeline_version.created", "pipeline_version", version.id)
+    _audit(db, current_user.id, "pipeline_version.created", "pipeline_version", version.id)
     db.commit()
     db.refresh(version)
     return {"version_id": version.id, "version": version.version, "review_status": version.review_status}
 
 
 @router.post("/pipelines/{pipeline_id}/schedule")
-def schedule_approved_pipeline(pipeline_id: uuid.UUID, body: ScheduleRequest, db: Session = Depends(get_db)):
+def schedule_approved_pipeline(pipeline_id: uuid.UUID, body: ScheduleRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     try:
         CronTrigger.from_crontab(body.cron_expression)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=f"Invalid five-field cron expression: {exc}") from exc
-    pipeline = _owned_pipeline(db, pipeline_id, body.actor_id, lock=True)
+    pipeline = _owned_pipeline(db, pipeline_id, current_user.id, lock=True)
     version = db.scalar(select(PipelineVersion).where(
         PipelineVersion.pipeline_id == pipeline.id, PipelineVersion.version == pipeline.version
     ))
@@ -523,7 +495,7 @@ def schedule_approved_pipeline(pipeline_id: uuid.UUID, body: ScheduleRequest, db
         schedule.pipeline_version_id = version.id
         schedule.cron_expression = body.cron_expression
     pipeline.status = PipelineStatus.scheduled
-    _audit(db, body.actor_id, "pipeline.scheduled", "pipeline", pipeline.id)
+    _audit(db, current_user.id, "pipeline.scheduled", "pipeline", pipeline.id)
     db.commit()
     db.refresh(schedule)
     register_schedule(db, schedule)

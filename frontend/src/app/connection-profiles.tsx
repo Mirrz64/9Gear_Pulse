@@ -1,6 +1,7 @@
 'use client';
 
 import { FormEvent, useEffect, useState } from 'react';
+import { useAuth } from '@clerk/nextjs';
 import { CheckCircle2, Plug, RefreshCw, Trash2 } from 'lucide-react';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
@@ -20,15 +21,17 @@ function getErrorMessage(payload: unknown): string {
   return 'The request could not be completed.';
 }
 
-export default function ConnectionProfiles({ actorId }: { actorId: string }) {
+// actorId is no longer used for auth (Bearer tokens replace it, via
+// getToken() below) - kept as a prop only so the parent's existing
+// wiring doesn't break before setup/page.tsx gets its own matching
+// cleanup pass.
+export default function ConnectionProfiles({ actorId }: { actorId?: string }) {
+  const { getToken } = useAuth();
   const [profiles, setProfiles] = useState<ConnectionProfile[]>([]);
   const [message, setMessage] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
 
-  // Structured fields instead of a raw JSON textarea - the whole point
-  // of this component. Assembled into the {"host", "port", ...} shape
-  // the backend's validate_credentials_shape() actually expects.
   const [name, setName] = useState('');
   const [host, setHost] = useState('');
   const [port, setPort] = useState('5432');
@@ -36,9 +39,15 @@ export default function ConnectionProfiles({ actorId }: { actorId: string }) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
 
+  const authHeaders = async (): Promise<HeadersInit> => {
+    const token = await getToken();
+    if (!token) throw new Error('You need to be signed in to do that.');
+    return { Authorization: `Bearer ${token}` };
+  };
+
   const loadProfiles = async () => {
     try {
-      const res = await fetch(`${API_BASE_URL}/api/v2/connection-profiles?actor_id=${actorId}`);
+      const res = await fetch(`${API_BASE_URL}/api/v2/connection-profiles`, { headers: await authHeaders() });
       const data: unknown = await res.json();
       if (!res.ok) throw new Error(getErrorMessage(data));
       setProfiles((data as { connection_profiles: ConnectionProfile[] }).connection_profiles || []);
@@ -48,20 +57,20 @@ export default function ConnectionProfiles({ actorId }: { actorId: string }) {
   };
 
   useEffect(() => {
-    if (actorId) void loadProfiles();
+    void loadProfiles();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [actorId]);
+  }, []);
 
   const createProfile = async (event: FormEvent) => {
     event.preventDefault();
     setCreating(true);
     setMessage(null);
     try {
+      const headers = await authHeaders();
       const res = await fetch(`${API_BASE_URL}/api/v2/connection-profiles`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { ...headers, 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          actor_id: actorId,
           name,
           type: 'postgres',
           credentials: { host, port: Number(port) || 5432, database, username, password },
@@ -88,10 +97,12 @@ export default function ConnectionProfiles({ actorId }: { actorId: string }) {
     setBusyId(profileId);
     setMessage(null);
     try {
+      const headers = await authHeaders();
+      // No body needed anymore - introspect no longer takes one now that
+      // actor_id isn't part of it.
       const res = await fetch(`${API_BASE_URL}/api/v2/connection-profiles/${profileId}/introspect`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ actor_id: actorId }),
+        headers,
       });
       const data: unknown = await res.json();
       if (!res.ok) throw new Error(getErrorMessage(data));
@@ -109,10 +120,8 @@ export default function ConnectionProfiles({ actorId }: { actorId: string }) {
     setBusyId(profileId);
     setMessage(null);
     try {
-      const res = await fetch(
-        `${API_BASE_URL}/api/v2/connection-profiles/${profileId}?actor_id=${actorId}`,
-        { method: 'DELETE' },
-      );
+      const headers = await authHeaders();
+      const res = await fetch(`${API_BASE_URL}/api/v2/connection-profiles/${profileId}`, { method: 'DELETE', headers });
       if (res.status !== 204) {
         const data: unknown = await res.json();
         throw new Error(getErrorMessage(data));

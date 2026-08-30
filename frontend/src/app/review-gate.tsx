@@ -49,16 +49,16 @@ interface ReviewPayload {
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
 const STORAGE_KEY = '9gear-review-gate-context';
 
-function getSavedContext(): { pipelineId: string; actorId: string } {
-  if (typeof window === 'undefined') return { pipelineId: '', actorId: '' };
+function getSavedPipelineId(): string {
+  if (typeof window === 'undefined') return '';
   try {
     const saved = window.localStorage.getItem(STORAGE_KEY);
-    if (!saved) return { pipelineId: '', actorId: '' };
-    const context = JSON.parse(saved) as { pipelineId?: string; actorId?: string };
-    return { pipelineId: context.pipelineId || '', actorId: context.actorId || '' };
+    if (!saved) return '';
+    const context = JSON.parse(saved) as { pipelineId?: string };
+    return context.pipelineId || '';
   } catch {
     window.localStorage.removeItem(STORAGE_KEY);
-    return { pipelineId: '', actorId: '' };
+    return '';
   }
 }
 
@@ -69,10 +69,13 @@ function getErrorMessage(payload: unknown): string {
   return 'The request could not be completed.';
 }
 
-export default function ReviewGate({ context }: { context?: { pipelineId: string; actorId: string } }) {
+// context still accepts an actorId field so setup/page.tsx's existing
+// wiring doesn't break before it gets its own matching cleanup pass -
+// it's just never read here anymore. Auth comes entirely from
+// useAuth()'s real session token now.
+export default function ReviewGate({ context }: { context?: { pipelineId: string; actorId?: string } }) {
   const { getToken } = useAuth();
-  const [pipelineId, setPipelineId] = useState(() => context?.pipelineId || getSavedContext().pipelineId);
-  const [actorId, setActorId] = useState(() => context?.actorId || getSavedContext().actorId);
+  const [pipelineId, setPipelineId] = useState(() => context?.pipelineId || getSavedPipelineId());
   const [review, setReview] = useState<ReviewPayload | null>(null);
   const [comment, setComment] = useState('');
   const [editedCode, setEditedCode] = useState('');
@@ -85,21 +88,20 @@ export default function ReviewGate({ context }: { context?: { pipelineId: string
   // a new draft pipeline, well after ReviewGate already mounted with no
   // context at all). Re-sync whenever a real context actually shows up.
   useEffect(() => {
-    if (context?.pipelineId && context?.actorId) {
+    if (context?.pipelineId) {
       setPipelineId(context.pipelineId);
-      setActorId(context.actorId);
     }
-  }, [context?.pipelineId, context?.actorId]);
+  }, [context?.pipelineId]);
 
-  // Auto-load whenever pipelineId/actorId actually change - covers both
-  // the sync above and a page refresh restoring a saved session from
+  // Auto-load whenever pipelineId actually changes - covers both the
+  // sync above and a page refresh restoring a saved session from
   // localStorage, without needing a manual "Load" click either time.
   useEffect(() => {
-    if (pipelineId.trim() && actorId.trim()) {
+    if (pipelineId.trim()) {
       void loadReview();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pipelineId, actorId]);
+  }, [pipelineId]);
 
   const loadReview = async (event?: FormEvent) => {
     event?.preventDefault();
@@ -125,7 +127,7 @@ export default function ReviewGate({ context }: { context?: { pipelineId: string
       const result = payload as ReviewPayload;
       setReview(result);
       setEditedCode(result.version.code);
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ pipelineId: pipelineId.trim(), actorId: actorId.trim() }));
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ pipelineId: pipelineId.trim() }));
     } catch (error) {
       setReview(null);
       setMessage(error instanceof Error ? error.message : 'Unable to load review details.');
@@ -138,10 +140,16 @@ export default function ReviewGate({ context }: { context?: { pipelineId: string
     setBusy(true);
     setMessage(null);
     try {
+      const token = await getToken();
+      if (!token) {
+        setMessage('You need to be signed in to do that.');
+        setBusy(false);
+        return false;
+      }
       const response = await fetch(`${API_BASE_URL}${path}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ actor_id: actorId.trim(), ...body }),
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify(body),
       });
       const payload: unknown = await response.json();
       if (!response.ok) throw new Error(getErrorMessage(payload));
@@ -206,9 +214,8 @@ export default function ReviewGate({ context }: { context?: { pipelineId: string
         {review && <span className="rounded-full border border-violet-800 bg-violet-950 px-2.5 py-1 text-xs font-semibold text-violet-300">v{review.version.number} · {review.version.review_status.replace('_', ' ')}</span>}
       </div>
 
-      <form onSubmit={loadReview} className="grid gap-3 md:grid-cols-[1fr_1fr_auto]">
+      <form onSubmit={loadReview} className="grid gap-3 md:grid-cols-[1fr_auto]">
         <input value={pipelineId} onChange={(event) => setPipelineId(event.target.value)} placeholder="Pipeline UUID" className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-violet-500 focus:outline-none" />
-        <input value={actorId} onChange={(event) => setActorId(event.target.value)} placeholder="Reviewer UUID (temporary)" className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-violet-500 focus:outline-none" />
         <button type="submit" disabled={busy} className="inline-flex items-center justify-center gap-2 rounded-lg border border-violet-700 bg-violet-950 px-4 py-2 text-xs font-semibold text-violet-200 hover:bg-violet-900 disabled:opacity-50"><RefreshCw className={`h-3.5 w-3.5 ${busy ? 'animate-spin' : ''}`} /> Load</button>
       </form>
 
