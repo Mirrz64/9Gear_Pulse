@@ -101,6 +101,18 @@ class PipelineReviewAction(str, enum.Enum):
     rejected = "rejected"
 
 
+class ArchitectureStatus(str, enum.Enum):
+    """The new, earlier gate: an AI-proposed plan (which real tables it
+    intends to read, what it'll write, its approach) reviewed by a human
+    BEFORE any code exists - not a replacement for the existing
+    code-level review_status, a checkpoint that happens before it.
+    Null on a version until propose-architecture is actually called.
+    """
+    pending_review = "pending_review"
+    approved = "approved"
+    rejected = "rejected"
+
+
 # ---------------------------------------------------------------------------
 # Tables
 # ---------------------------------------------------------------------------
@@ -228,6 +240,15 @@ class PipelineVersion(Base):
     # rather than a human edit.
     created_by: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
+    )
+    # The architecture-review gate: AI's proposed plan (real tables it
+    # intends to read, destination, approach, and an explicit
+    # feasible/not-feasible call) stored as structured JSON, reviewed
+    # before generate_and_test_pipeline is allowed to run at all. Both
+    # null until propose-architecture is actually called on this version.
+    architecture_proposal: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    architecture_status: Mapped[Optional[ArchitectureStatus]] = mapped_column(
+        SAEnum(ArchitectureStatus, name="architecture_status"), nullable=True
     )
     review_status: Mapped[PipelineVersionReviewStatus] = mapped_column(
         SAEnum(PipelineVersionReviewStatus, name="pipeline_version_review_status"),

@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 from auth import get_current_user
 
 from models import (
+    ArchitectureStatus,
     AuditLog,
     ConnectionProfile,
     ConnectionType,
@@ -290,6 +291,104 @@ def create_pipeline(body: CreatePipelineRequest, db: Session = Depends(get_db), 
     return {"pipeline_id": pipeline.id, "version_id": version.id, "status": pipeline.status}
 
 
+@router.post("/pipelines/{pipeline_id}/propose-architecture")
+def propose_pipeline_architecture(pipeline_id: uuid.UUID, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Stage A: assess the goal against the real schema and propose a plan,
+    before any code exists. Can be called again to get a fresh proposal
+    (e.g. after re-introspecting) - this resets the gate back to
+    pending_review, requiring re-approval, rather than silently keeping
+    a stale prior approval valid against a new proposal.
+    """
+    pipeline = _owned_pipeline(db, pipeline_id, current_user.id, lock=True)
+    source = db.get(ConnectionProfile, pipeline.source_connection_id)
+    if source is None:
+        raise HTTPException(status_code=409, detail="Pipeline source connection profile is missing")
+    if not source.schema_metadata_json:
+        raise HTTPException(status_code=409, detail="Introspect the source connection before proposing an architecture")
+
+    version = db.scalar(select(PipelineVersion).where(
+        PipelineVersion.pipeline_id == pipeline.id, PipelineVersion.version == pipeline.version
+    ).with_for_update())
+    if version is None:
+        raise HTTPException(status_code=404, detail="Pipeline has no current version")
+    if version.review_status != PipelineVersionReviewStatus.draft:
+        raise HTTPException(
+            status_code=409,
+            detail="Architecture can only be proposed for a version that hasn't been generated yet",
+        )
+
+    from propose_architecture import propose_architecture
+    goal = pipeline.project.goal_description
+    # Scoped to this specific version's own rejections, not the whole
+    # pipeline's history - safe to assume any rejection found here is an
+    # architecture rejection (not a code one), since this version has
+    # never left 'draft' review_status. Code review only ever happens on
+    # a later version, created after generation succeeds.
+    latest_rejection = db.scalar(
+        select(PipelineReview)
+        .where(
+            PipelineReview.pipeline_version_id == version.id,
+            PipelineReview.action == PipelineReviewAction.rejected,
+        )
+        .order_by(PipelineReview.created_at.desc())
+        .limit(1)
+    )
+    if latest_rejection and latest_rejection.comment:
+        goal = (
+            f"{goal}\n\nA previous architecture proposal for this pipeline was "
+            f"rejected during human review with this feedback - address it in "
+            f"this proposal:\n{latest_rejection.comment}"
+        )
+
+    try:
+        proposal = propose_architecture(source.schema_metadata_json, goal)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Architecture proposal failed: {exc}") from exc
+
+    version.architecture_proposal = proposal
+    version.architecture_status = ArchitectureStatus.pending_review
+    _audit(db, current_user.id, "pipeline_version.architecture_proposed", "pipeline_version", version.id)
+    db.commit()
+    db.refresh(version)
+    return {
+        "version_id": version.id,
+        "architecture_proposal": version.architecture_proposal,
+        "architecture_status": version.architecture_status,
+    }
+
+
+@router.post("/pipeline-versions/{version_id}/approve-architecture")
+def approve_architecture(version_id: uuid.UUID, body: ReviewRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    version = _owned_version(db, version_id, current_user.id, lock=True)
+    if version.architecture_status != ArchitectureStatus.pending_review:
+        raise HTTPException(status_code=409, detail="Only an architecture proposal awaiting review can be approved")
+    version.architecture_status = ArchitectureStatus.approved
+    # Reuses PipelineReview/AuditLog rather than a new table - a known,
+    # deliberate simplification for this first pass: nothing currently
+    # distinguishes an architecture-review row from a code-review row
+    # other than timing (architecture reviews always happen while
+    # review_status is still 'draft'). Revisit with a review_type column
+    # if that ambiguity ever actually causes confusion in practice.
+    db.add(PipelineReview(pipeline_version_id=version.id, actor_id=current_user.id,
+                          action=PipelineReviewAction.approved, comment=body.comment))
+    _audit(db, current_user.id, "pipeline_version.architecture_approved", "pipeline_version", version.id)
+    db.commit()
+    return {"version_id": version.id, "architecture_status": "approved"}
+
+
+@router.post("/pipeline-versions/{version_id}/reject-architecture")
+def reject_architecture(version_id: uuid.UUID, body: ReviewRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    version = _owned_version(db, version_id, current_user.id, lock=True)
+    if version.architecture_status != ArchitectureStatus.pending_review:
+        raise HTTPException(status_code=409, detail="Only an architecture proposal awaiting review can be rejected")
+    version.architecture_status = ArchitectureStatus.rejected
+    db.add(PipelineReview(pipeline_version_id=version.id, actor_id=current_user.id,
+                          action=PipelineReviewAction.rejected, comment=body.comment))
+    _audit(db, current_user.id, "pipeline_version.architecture_rejected", "pipeline_version", version.id)
+    db.commit()
+    return {"version_id": version.id, "architecture_status": "rejected"}
+
+
 @router.post("/pipelines/{pipeline_id}/generate")
 def generate_and_test_pipeline(pipeline_id: uuid.UUID, body: GenerateRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Generate code from cached source schema, sandbox it, and persist evidence."""
@@ -300,6 +399,18 @@ def generate_and_test_pipeline(pipeline_id: uuid.UUID, body: GenerateRequest, db
         raise HTTPException(status_code=409, detail="Pipeline connection profile is missing")
     if not source.schema_metadata_json:
         raise HTTPException(status_code=409, detail="Introspect the source connection before generating a pipeline")
+
+    current_version = db.scalar(select(PipelineVersion).where(
+        PipelineVersion.pipeline_id == pipeline.id, PipelineVersion.version == pipeline.version
+    ).with_for_update())
+    if current_version is None or current_version.architecture_status != ArchitectureStatus.approved:
+        # This is the actual gate Stage A exists for - code generation is
+        # not allowed to run until a human has approved a real, honest
+        # assessment of whether the goal matches the schema. No bypass.
+        raise HTTPException(
+            status_code=409,
+            detail="Propose and approve an architecture for this pipeline before generating code.",
+        )
 
     # If the most recent review on this pipeline was a rejection, fold the
     # reviewer's comment into the goal context - otherwise regeneration is
@@ -337,7 +448,9 @@ def generate_and_test_pipeline(pipeline_id: uuid.UUID, body: GenerateRequest, db
         raise HTTPException(status_code=502, detail=f"Pipeline generation failed: {exc}") from exc
     version_number = pipeline.version + 1
     version = PipelineVersion(pipeline_id=pipeline.id, version=version_number, generated_code=code,
-                              created_by=current_user.id, review_status=PipelineVersionReviewStatus.testing)
+                              created_by=current_user.id, review_status=PipelineVersionReviewStatus.testing,
+                              architecture_proposal=current_version.architecture_proposal,
+                              architecture_status=current_version.architecture_status)
     pipeline.version = version_number
     pipeline.generated_code = code
     pipeline.status = PipelineStatus.testing
@@ -422,6 +535,8 @@ def get_review(pipeline_id: uuid.UUID, db: Session = Depends(get_db), current_us
             "id": current.id, "number": current.version, "code": current.generated_code,
             "review_status": current.review_status, "reviewed_by": current.reviewed_by,
             "reviewed_at": current.reviewed_at,
+            "architecture_proposal": current.architecture_proposal,
+            "architecture_status": current.architecture_status,
             # The frontend can calculate/render a diff from these two texts.
             "previous_code": previous.generated_code if previous else None,
         },
