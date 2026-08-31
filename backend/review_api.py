@@ -135,6 +135,22 @@ def _audit(db: Session, actor_id: uuid.UUID, action: str, entity_type: str, enti
     db.add(AuditLog(actor_id=actor_id, action=action, entity_type=entity_type, entity_id=entity_id))
 
 
+@router.get("/schedules")
+def list_schedules(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    rows = db.execute(
+        select(Schedule, Pipeline.version, Project.name)
+        .join(Pipeline, Schedule.pipeline_id == Pipeline.id)
+        .join(Project, Pipeline.project_id == Project.id)
+        .where(Project.owner_id == current_user.id)
+        .order_by(Schedule.next_run_at)
+    ).all()
+    return {"schedules": [
+        {"id": schedule.id, "pipeline_id": schedule.pipeline_id, "cron_expression": schedule.cron_expression,
+         "next_run_at": schedule.next_run_at, "pipeline_version": pipeline_version, "project_name": project_name}
+        for schedule, pipeline_version, project_name in rows
+    ]}
+
+
 @router.get("/projects")
 def list_projects(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     projects = db.scalars(select(Project).where(Project.owner_id == current_user.id).order_by(Project.created_at.desc()))
@@ -151,6 +167,26 @@ def create_project(body: CreateProjectRequest, db: Session = Depends(get_db), cu
     db.commit()
     db.refresh(project)
     return {"id": project.id, "name": project.name, "goal_description": project.goal_description}
+
+
+@router.get("/projects/{project_id}")
+def get_project(project_id: uuid.UUID, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    project = db.scalar(select(Project).where(Project.id == project_id, Project.owner_id == current_user.id))
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return {"id": project.id, "name": project.name, "goal_description": project.goal_description,
+            "status": project.status, "created_at": project.created_at}
+
+
+@router.get("/projects/{project_id}/pipelines")
+def list_project_pipelines(project_id: uuid.UUID, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    project = db.scalar(select(Project).where(Project.id == project_id, Project.owner_id == current_user.id))
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    pipelines = db.scalars(
+        select(Pipeline).where(Pipeline.project_id == project_id).order_by(Pipeline.version.desc())
+    )
+    return {"pipelines": [{"id": p.id, "status": p.status, "version": p.version} for p in pipelines]}
 
 
 @router.get("/connection-profiles")

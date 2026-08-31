@@ -1,708 +1,117 @@
 'use client';
 
-import React, { useState, useEffect, useRef, Fragment } from 'react';
-import {
-  Play, Database, Activity, RefreshCw, CheckCircle, AlertCircle,
-  ChevronDown, ChevronUp, Terminal, Table, X, Code, Eye, EyeOff,
-  PlusCircle, Search, Clock, Copy, Download, Calendar, Check, Trash2,
-  Radio
-} from 'lucide-react';
+import Image from 'next/image';
+import Link from 'next/link';
+import { SignInButton, SignUpButton } from '@clerk/nextjs';
+import { Bot, ShieldCheck, ClipboardCheck, RefreshCw, Lock, ArrowRight } from 'lucide-react';
 
-interface AuditLog {
-  id: number;
-  pipeline_name: string;
-  status: string;
-  attempts: number;
-  execution_time: string;
-  logs: string;
-}
+const features = [
+  {
+    icon: Bot,
+    color: 'text-indigo-400',
+    bg: 'bg-indigo-950 border-indigo-800',
+    title: 'AI Generation',
+    body: 'Describe a pipeline goal in plain English. Claude Sonnet 5 writes it, with GPT-4o as an automatic fallback - structured, schema-enforced output, not a guess.',
+  },
+  {
+    icon: RefreshCw,
+    color: 'text-amber-400',
+    bg: 'bg-amber-950 border-amber-800',
+    title: 'Self-Healing Sandbox',
+    body: 'Every pipeline runs in an isolated container against your real destination before anyone sees it. Real failures get diagnosed and repaired automatically, up to three attempts.',
+  },
+  {
+    icon: ClipboardCheck,
+    color: 'text-violet-400',
+    bg: 'bg-violet-950 border-violet-800',
+    title: 'Human Review Gate',
+    body: "Nothing reaches production on an AI's say-so. Every version needs an explicit approval, with the full code diff and sandbox evidence in front of you.",
+  },
+  {
+    icon: ShieldCheck,
+    color: 'text-emerald-400',
+    bg: 'bg-emerald-950 border-emerald-800',
+    title: 'Data Quality Checks',
+    body: "Catches what a green checkmark can hide - a column that loaded but came back silently empty, or a table that was never created at all.",
+  },
+  {
+    icon: Lock,
+    color: 'text-cyan-400',
+    bg: 'bg-cyan-950 border-cyan-800',
+    title: 'Secure by Design',
+    body: 'Credentials are encrypted at rest and never sent to the AI - only cached schema shape is. Every action is tied to a verified, authenticated identity.',
+  },
+];
 
-interface ColumnSchema {
-  column_name: string;
-  data_type: string;
-}
-
-type SchemaMap = Record<string, ColumnSchema[]>;
-
-interface ScheduleJob {
-  id: string;
-  next_run_time: string;
-  trigger: string;
-}
-
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
-
-export default function Dashboard() {
-  const [goal, setGoal] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [logs, setLogs] = useState<AuditLog[]>([]);
-  const [schema, setSchema] = useState<SchemaMap>({});
-  const [generatedCode, setGeneratedCode] = useState<string>('');
-  const [activeTab, setActiveTab] = useState<'logs' | 'code'>('logs');
-  const [statusMessage, setStatusMessage] = useState<string | null>(null);
-  const [expandedLogId, setExpandedLogId] = useState<number | null>(null);
-
-  // Live SSE Streaming State
-  const [liveStreamLogs, setLiveStreamLogs] = useState<string[]>([]);
-  const [isStreaming, setIsStreaming] = useState(false);
-  const terminalEndRef = useRef<HTMLDivElement>(null);
-
-  // Side Drawers
-  const [isSchemaDrawerOpen, setIsSchemaDrawerOpen] = useState(false);
-  const [isScheduleDrawerOpen, setIsScheduleDrawerOpen] = useState(false);
-
-  // Schema Search & Filtering
-  const [schemaSearch, setSchemaSearch] = useState('');
-  const [hideDltTables, setHideDltTables] = useState(true);
-
-  // Log Search & Filtering
-  const [searchQuery, setSearchQuery] = useState('');
-  const [statusFilter, setStatusFilter] = useState<'ALL' | 'SUCCESS' | 'FAILED'>('ALL');
-
-  // Scheduling State
-  const [scheduleGoal, setScheduleGoal] = useState('');
-  const [intervalMinutes, setIntervalMinutes] = useState<number>(30);
-  const [schedules, setSchedules] = useState<ScheduleJob[]>([]);
-  const [scheduleStatus, setScheduleStatus] = useState<string | null>(null);
-
-  // Copy Feedback State
-  const [copiedType, setCopiedType] = useState<'code' | 'logs' | 'stream' | null>(null);
-
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-
-  // Helper for safe date formatting
-  const formatDate = (dateStr: string) => {
-    if (!dateStr) return 'N/A';
-    const parsed = new Date(dateStr);
-    return isNaN(parsed.getTime()) ? dateStr : parsed.toLocaleString();
-  };
-
-  const fetchLogs = async () => {
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/logs`);
-      if (res.ok) {
-        const data = await res.json();
-        setLogs(data.logs || []);
-      }
-    } catch (err) {
-      console.error('Failed to fetch logs:', err);
-    }
-  };
-
-  const fetchSchema = async () => {
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/schema`);
-      if (res.ok) {
-        const data = await res.json();
-        setSchema(data.schema || {});
-      }
-    } catch (err) {
-      console.error('Failed to fetch schema:', err);
-    }
-  };
-
-  const fetchCode = async () => {
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/code`);
-      if (res.ok) {
-        const data = await res.json();
-        setGeneratedCode(data.code || '');
-      }
-    } catch (err) {
-      console.error('Failed to fetch generated code:', err);
-    }
-  };
-
-  const fetchSchedules = async () => {
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/schedules`);
-      if (res.ok) {
-        const data = await res.json();
-        setSchedules(data.schedules || []);
-      }
-    } catch (err) {
-      console.error('Failed to fetch schedules:', err);
-    }
-  };
-
-  useEffect(() => {
-    fetchLogs();
-    fetchSchema();
-    fetchCode();
-    fetchSchedules();
-  }, []);
-
-  // Auto-scroll stream terminal to bottom
-  useEffect(() => {
-    if (isStreaming && terminalEndRef.current) {
-      terminalEndRef.current.scrollIntoView({ behavior: 'smooth' });
-    }
-  }, [liveStreamLogs, isStreaming]);
-
-  const handleRunPipeline = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!goal.trim()) return;
-
-    setLoading(true);
-    setIsStreaming(true);
-    setLiveStreamLogs([]);
-    setStatusMessage('Initiating pipeline execution...');
-
-    // Open SSE Connection for Live Logs
-    const jobId = `job_${Date.now()}`;
-    const eventSource = new EventSource(`${API_BASE_URL}/api/stream-logs/${jobId}`);
-
-    eventSource.onmessage = (event) => {
-      if (event.data === '[DONE]' || event.data === '[COMPLETE]') {
-        eventSource.close();
-        setIsStreaming(false);
-      } else {
-        setLiveStreamLogs((prev) => [...prev, event.data]);
-      }
-    };
-
-    eventSource.onerror = () => {
-      eventSource.close();
-      setIsStreaming(false);
-    };
-
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/run`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ goal, max_retries: 3 }),
-      });
-
-      if (res.ok) {
-        setStatusMessage('Pipeline executed successfully!');
-        setGoal('');
-        fetchLogs();
-        fetchSchema();
-        fetchCode();
-      } else {
-        const err = await res.json();
-        setStatusMessage(`Execution failed: ${err.detail || 'Unknown error'}`);
-      }
-    } catch (err) {
-      setStatusMessage('Failed to connect to FastAPI backend.');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleSchedulePipeline = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!scheduleGoal.trim()) return;
-
-    setScheduleStatus('Scheduling job...');
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/schedule`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          goal: scheduleGoal,
-          interval_minutes: Number(intervalMinutes),
-          max_retries: 3,
-        }),
-      });
-
-      if (res.ok) {
-        setScheduleStatus('Pipeline scheduled successfully!');
-        setScheduleGoal('');
-        fetchSchedules();
-      } else {
-        const err = await res.json();
-        setScheduleStatus(`Scheduling failed: ${err.detail || 'Unknown error'}`);
-      }
-    } catch (err) {
-      setScheduleStatus('Failed to connect to backend.');
-    }
-  };
-
-  const handleDeleteSchedule = async (jobId: string) => {
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/schedule/${jobId}`, {
-        method: 'DELETE',
-      });
-      if (res.ok) {
-        fetchSchedules();
-      }
-    } catch (err) {
-      console.error('Failed to delete schedule:', err);
-    }
-  };
-
-  const insertMetadataIntoGoal = (textToInsert: string) => {
-    if (!textareaRef.current) {
-      setGoal((prev) => (prev ? `${prev} ${textToInsert}` : textToInsert));
-      return;
-    }
-
-    const start = textareaRef.current.selectionStart ?? goal.length;
-    const end = textareaRef.current.selectionEnd ?? goal.length;
-    const updatedGoal = goal.substring(0, start) + textToInsert + goal.substring(end);
-
-    setGoal(updatedGoal);
-
-    setTimeout(() => {
-      if (textareaRef.current) {
-        textareaRef.current.focus();
-        textareaRef.current.setSelectionRange(start + textToInsert.length, start + textToInsert.length);
-      }
-    }, 0);
-  };
-
-  const copyToClipboard = (text: string, type: 'code' | 'logs' | 'stream') => {
-    navigator.clipboard.writeText(text);
-    setCopiedType(type);
-    setTimeout(() => setCopiedType(null), 2000);
-  };
-
-  const downloadArtifact = (content: string, filename: string) => {
-    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = filename;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
-  };
-
-  const toggleExpand = (id: number) => {
-    setExpandedLogId(expandedLogId === id ? null : id);
-  };
-
-  const filteredLogs = logs.filter((log) => {
-    const matchesSearch =
-      log.pipeline_name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      log.id.toString().includes(searchQuery);
-
-    const matchesStatus =
-      statusFilter === 'ALL' || log.status.toUpperCase() === statusFilter;
-
-    return matchesSearch && matchesStatus;
-  });
-
-  const filteredSchema = Object.entries(schema).filter(([tableName]) => {
-    if (hideDltTables && (tableName.includes('_dlt_') || tableName.startsWith('_pipeline_audit'))) {
-      return false;
-    }
-    return tableName.toLowerCase().includes(schemaSearch.toLowerCase());
-  });
-
+export default function LandingPage() {
   return (
-    <main className="min-h-screen bg-slate-950 text-slate-100 p-8 font-sans relative overflow-x-hidden">
-      <div className="max-w-6xl mx-auto space-y-8">
-        {/* Header */}
-        <header className="flex items-center justify-between border-b border-slate-800 pb-6">
-          <div className="flex items-center space-x-3">
-            <Activity className="h-8 w-8 text-blue-500" />
-            <div>
-              <h1 className="text-2xl font-bold tracking-tight">9Gear Pulse</h1>
-              <p className="text-xs text-slate-400">Autonomous Data Engine Control Plane</p>
-            </div>
-          </div>
-          <div className="flex items-center space-x-3">
-            <button
-              onClick={() => setIsScheduleDrawerOpen(true)}
-              className="flex items-center gap-2 bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 px-3 py-2 rounded-lg text-sm transition"
-            >
-              <Calendar className="h-4 w-4 text-emerald-400" />
-              Schedules ({schedules.length})
-            </button>
-            <button
-              onClick={() => setIsSchemaDrawerOpen(true)}
-              className="flex items-center gap-2 bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 px-3 py-2 rounded-lg text-sm transition"
-            >
-              <Table className="h-4 w-4 text-blue-400" />
-              View Schema
-            </button>
-            <button
-              onClick={() => { fetchLogs(); fetchCode(); fetchSchedules(); }}
-              className="p-2 text-slate-400 hover:text-slate-100 hover:bg-slate-900 rounded-lg transition"
-              title="Refresh Audit Logs"
-              aria-label="Refresh Audit Logs"
-            >
-              <RefreshCw className="h-5 w-5" />
-            </button>
-          </div>
-        </header>
-
-        {/* Pipeline Execution Card */}
-        <section className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-xl">
-          <h2 className="text-lg font-semibold mb-3 flex items-center gap-2">
-            <Database className="h-5 w-5 text-blue-400" />
-            Execute New Pipeline Goal
-          </h2>
-          <form onSubmit={handleRunPipeline} className="space-y-4">
-            <textarea
-              ref={textareaRef}
-              value={goal}
-              onChange={(e) => setGoal(e.target.value)}
-              placeholder="e.g. Extract all records from users table, append dynamic attributes, and load into analytics_reporting with auto schema evolution"
-              className="w-full h-28 bg-slate-950 border border-slate-800 rounded-lg p-4 text-sm text-slate-200 placeholder-slate-500 focus:outline-none focus:border-blue-500 transition resize-none"
-              disabled={loading}
-            />
-            <div className="flex items-center justify-between">
-              {statusMessage && (
-                <p className={`text-xs ${statusMessage.includes('failed') ? 'text-red-400' : 'text-blue-400'}`}>
-                  {statusMessage}
-                </p>
-              )}
-              <button
-                type="submit"
-                disabled={loading || !goal.trim()}
-                className="ml-auto bg-blue-600 hover:bg-blue-500 disabled:bg-slate-800 text-white font-medium px-5 py-2.5 rounded-lg flex items-center gap-2 text-sm transition"
-              >
-                {loading ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4 fill-current" />}
-                {loading ? 'Orchestrating...' : 'Run Pipeline'}
-              </button>
-            </div>
-          </form>
-        </section>
-
-        {/* Live Execution SSE Console */}
-        {(isStreaming || liveStreamLogs.length > 0) && (
-          <section className="bg-slate-900 border border-blue-900/50 rounded-xl p-6 shadow-xl space-y-3">
-            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-              <div className="flex items-center gap-2">
-                <Radio className={`h-4 w-4 ${isStreaming ? 'text-emerald-400 animate-pulse' : 'text-slate-500'}`} />
-                <h3 className="text-sm font-semibold text-slate-200">Live Execution Terminal Stream</h3>
-              </div>
-              <button
-                onClick={() => copyToClipboard(liveStreamLogs.join('\n'), 'stream')}
-                className="flex items-center gap-1 text-xs bg-slate-950 hover:bg-slate-800 border border-slate-800 text-slate-300 px-2.5 py-1 rounded transition"
-              >
-                {copiedType === 'stream' ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : <Copy className="h-3.5 w-3.5" />}
-                {copiedType === 'stream' ? 'Copied!' : 'Copy Logs'}
-              </button>
-            </div>
-            <div className="bg-slate-950 border border-slate-800 rounded-lg p-4 h-48 overflow-y-auto font-mono text-xs text-emerald-400 space-y-1">
-              {liveStreamLogs.map((logLine, idx) => (
-                <div key={idx} className="whitespace-pre-wrap">{logLine}</div>
-              ))}
-              <div ref={terminalEndRef} />
-            </div>
-          </section>
-        )}
-
-        {/* Execution Audit Table */}
-        <section className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-xl space-y-4">
-          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
-            <h2 className="text-lg font-semibold">Execution Audit Logs</h2>
-
-            <div className="flex flex-wrap items-center gap-3">
-              <div className="relative">
-                <Search className="h-4 w-4 text-slate-500 absolute left-3 top-2.5" />
-                <input
-                  type="text"
-                  placeholder="Search by name or ID..."
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  className="bg-slate-950 border border-slate-800 rounded-lg pl-9 pr-3 py-1.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-blue-500 transition w-48"
-                />
-              </div>
-              <div className="flex items-center bg-slate-950 border border-slate-800 rounded-lg p-1">
-                {(['ALL', 'SUCCESS', 'FAILED'] as const).map((status) => (
-                  <button
-                    key={status}
-                    onClick={() => setStatusFilter(status)}
-                    className={`px-3 py-1 rounded-md text-xs font-semibold transition ${statusFilter === status
-                      ? 'bg-blue-600 text-white'
-                      : 'text-slate-400 hover:text-slate-200'
-                      }`}
-                  >
-                    {status}
-                  </button>
-                ))}
-              </div>
-            </div>
-          </div>
-
-          <div className="overflow-x-auto">
-            <table className="w-full text-left text-sm text-slate-400">
-              <thead className="bg-slate-950 text-slate-300 uppercase text-xs border-b border-slate-800">
-                <tr>
-                  <th className="p-3">ID</th>
-                  <th className="p-3">Pipeline Name</th>
-                  <th className="p-3">Status</th>
-                  <th className="p-3">Attempts</th>
-                  <th className="p-3">Execution Time</th>
-                  <th className="p-3 text-right">Details</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-800">
-                {filteredLogs.length === 0 ? (
-                  <tr>
-                    <td colSpan={6} className="p-4 text-center text-slate-500">
-                      No matching audit records found.
-                    </td>
-                  </tr>
-                ) : (
-                  filteredLogs.map((log) => (
-                    <Fragment key={log.id}>
-                      <tr
-                        onClick={() => toggleExpand(log.id)}
-                        className="hover:bg-slate-800/50 cursor-pointer transition"
-                      >
-                        <td className="p-3 font-mono text-xs">{log.id}</td>
-                        <td className="p-3 font-medium text-slate-200">{log.pipeline_name}</td>
-                        <td className="p-3">
-                          <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold ${log.status === 'SUCCESS' ? 'bg-emerald-950 text-emerald-400 border border-emerald-800' : 'bg-rose-950 text-rose-400 border border-rose-800'
-                            }`}>
-                            {log.status === 'SUCCESS' ? <CheckCircle className="h-3 w-3" /> : <AlertCircle className="h-3 w-3" />}
-                            {log.status}
-                          </span>
-                        </td>
-                        <td className="p-3 font-mono text-xs">{log.attempts}</td>
-                        <td className="p-3 text-xs">{formatDate(log.execution_time)}</td>
-                        <td className="p-3 text-right">
-                          <button className="text-slate-400 hover:text-slate-200 p-1" aria-label="Toggle Details">
-                            {expandedLogId === log.id ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
-                          </button>
-                        </td>
-                      </tr>
-                      {expandedLogId === log.id && (
-                        <tr className="bg-slate-950/80 border-b border-slate-800">
-                          <td colSpan={6} className="p-4">
-                            <div className="space-y-3">
-                              <div className="flex items-center justify-between border-b border-slate-800 pb-2">
-                                <div className="flex items-center gap-2">
-                                  <button
-                                    onClick={() => setActiveTab('logs')}
-                                    className={`flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-md transition ${activeTab === 'logs' ? 'bg-blue-950 border border-blue-800 text-blue-400' : 'text-slate-400 hover:text-slate-200'
-                                      }`}
-                                  >
-                                    <Terminal className="h-3.5 w-3.5" />
-                                    Terminal Logs
-                                  </button>
-                                  <button
-                                    onClick={() => setActiveTab('code')}
-                                    className={`flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-md transition ${activeTab === 'code' ? 'bg-blue-950 border border-blue-800 text-blue-400' : 'text-slate-400 hover:text-slate-200'
-                                      }`}
-                                  >
-                                    <Code className="h-3.5 w-3.5" />
-                                    Generated Python Code
-                                  </button>
-                                </div>
-
-                                <div className="flex items-center gap-2">
-                                  <button
-                                    onClick={() => copyToClipboard(
-                                      activeTab === 'logs' ? (log.logs || '') : generatedCode,
-                                      activeTab
-                                    )}
-                                    className="flex items-center gap-1 text-xs bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 px-2.5 py-1 rounded transition"
-                                  >
-                                    {copiedType === activeTab ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : <Copy className="h-3.5 w-3.5" />}
-                                    {copiedType === activeTab ? 'Copied!' : 'Copy'}
-                                  </button>
-                                  <button
-                                    onClick={() => downloadArtifact(
-                                      activeTab === 'logs' ? (log.logs || '') : generatedCode,
-                                      activeTab === 'logs' ? `execution_log_${log.id}.log` : `${log.pipeline_name}.py`
-                                    )}
-                                    className="flex items-center gap-1 text-xs bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 px-2.5 py-1 rounded transition"
-                                  >
-                                    <Download className="h-3.5 w-3.5 text-blue-400" />
-                                    Download
-                                  </button>
-                                </div>
-                              </div>
-
-                              {activeTab === 'logs' ? (
-                                <pre className="p-3 bg-slate-900 border border-slate-800 rounded-lg text-xs font-mono text-slate-300 overflow-x-auto whitespace-pre-wrap max-h-60">
-                                  {log.logs || 'No log details recorded for this run.'}
-                                </pre>
-                              ) : (
-                                <pre className="p-3 bg-slate-900 border border-slate-800 rounded-lg text-xs font-mono text-emerald-400 overflow-x-auto whitespace-pre-wrap max-h-60">
-                                  {generatedCode || '# No generated pipeline script available.'}
-                                </pre>
-                              )}
-                            </div>
-                          </td>
-                        </tr>
-                      )}
-                    </Fragment>
-                  ))
-                )}
-              </tbody>
-            </table>
-          </div>
-        </section>
+    <main className="min-h-screen bg-slate-950 text-slate-100">
+      <div className="pointer-events-none fixed inset-0 overflow-hidden">
+        <div className="absolute -top-32 left-1/4 h-96 w-96 rounded-full bg-cyan-500/10 blur-3xl" />
+        <div className="absolute top-1/3 right-1/4 h-96 w-96 rounded-full bg-violet-500/10 blur-3xl" />
       </div>
 
-      {/* Scheduler Drawer */}
-      {isScheduleDrawerOpen && (
-        <div className="fixed inset-0 z-50 flex justify-end bg-slate-950/60 backdrop-blur-sm">
-          <div className="w-full max-w-md bg-slate-900 border-l border-slate-800 h-full p-6 shadow-2xl flex flex-col space-y-6">
-            <div className="flex items-center justify-between border-b border-slate-800 pb-4">
-              <div className="flex items-center gap-2">
-                <Calendar className="h-5 w-5 text-emerald-400" />
-                <h3 className="text-lg font-semibold text-slate-100">Automated Pipeline Scheduler</h3>
-              </div>
-              <button
-                onClick={() => setIsScheduleDrawerOpen(false)}
-                className="p-1 text-slate-400 hover:text-slate-100 hover:bg-slate-800 rounded transition"
-                aria-label="Close Scheduler Drawer"
-              >
-                <X className="h-5 w-5" />
-              </button>
-            </div>
-
-            <form onSubmit={handleSchedulePipeline} className="space-y-4 bg-slate-950 p-4 rounded-xl border border-slate-800">
-              <h4 className="text-xs uppercase tracking-wider font-semibold text-slate-400">Schedule Recurring Pipeline</h4>
-              <div>
-                <label className="block text-xs text-slate-400 mb-1">Goal Prompt</label>
-                <textarea
-                  value={scheduleGoal}
-                  onChange={(e) => setScheduleGoal(e.target.value)}
-                  placeholder="e.g. Sync users table to analytics_reporting.users_snapshot every 30 minutes"
-                  className="w-full h-20 bg-slate-900 border border-slate-800 rounded-lg p-2.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-emerald-500 transition resize-none"
-                />
-              </div>
-              <div>
-                <label className="block text-xs text-slate-400 mb-1">Interval (Minutes)</label>
-                <input
-                  type="number"
-                  min={1}
-                  value={intervalMinutes}
-                  onChange={(e) => setIntervalMinutes(Number(e.target.value))}
-                  className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-xs text-slate-200 focus:outline-none focus:border-emerald-500 transition"
-                />
-              </div>
-              {scheduleStatus && (
-                <p className={`text-xs ${scheduleStatus.includes('failed') ? 'text-rose-400' : 'text-emerald-400'}`}>
-                  {scheduleStatus}
-                </p>
-              )}
-              <button
-                type="submit"
-                disabled={!scheduleGoal.trim()}
-                className="w-full bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-800 text-white font-medium py-2 rounded-lg text-xs transition flex items-center justify-center gap-1.5"
-              >
-                <Clock className="h-3.5 w-3.5" />
-                Create Scheduled Job
-              </button>
-            </form>
-
-            <div className="flex-1 overflow-y-auto space-y-3">
-              <h4 className="text-xs uppercase tracking-wider font-semibold text-slate-400">Active Background Jobs</h4>
-              {schedules.length === 0 ? (
-                <p className="text-xs text-slate-500">No active background schedules found.</p>
-              ) : (
-                schedules.map((schedule) => (
-                  <div key={schedule.id} className="bg-slate-950 border border-slate-800 rounded-lg p-3 space-y-1.5">
-                    <div className="flex items-center justify-between">
-                      <span className="font-mono text-xs font-semibold text-emerald-400">{schedule.id}</span>
-                      <button
-                        onClick={() => handleDeleteSchedule(schedule.id)}
-                        className="p-1 text-slate-500 hover:text-rose-400 hover:bg-slate-900 rounded transition"
-                        aria-label="Delete schedule"
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </button>
-                    </div>
-                    <p className="text-xs text-slate-400">
-                      Trigger: <span className="text-slate-300 font-mono">{schedule.trigger}</span>
-                    </p>
-                    <p className="text-[11px] text-slate-500">
-                      Next Run: {formatDate(schedule.next_run_time)}
-                    </p>
-                  </div>
-                ))
-              )}
-            </div>
+      <header className="relative border-b border-slate-800">
+        <div className="mx-auto flex max-w-5xl items-center justify-between px-8 py-5">
+          <div className="flex items-center gap-2">
+            <Image src="/logo-icon.png" alt="9Gear Pulse" width={28} height={28} className="rounded" />
+            <span className="text-sm font-bold tracking-tight">9Gear Pulse</span>
+          </div>
+          <div className="flex items-center gap-3 text-xs font-semibold">
+            <SignInButton forceRedirectUrl="/projects">
+              <button className="rounded-lg px-3 py-2 text-slate-300 hover:text-white">Sign in</button>
+            </SignInButton>
+            <SignUpButton forceRedirectUrl="/projects">
+              <button className="rounded-lg bg-cyan-600 px-3 py-2 text-white hover:bg-cyan-500">Sign up</button>
+            </SignUpButton>
           </div>
         </div>
-      )}
+      </header>
 
-      {/* Schema Drawer */}
-      {isSchemaDrawerOpen && (
-        <div className="fixed inset-0 z-50 flex justify-end bg-slate-950/60 backdrop-blur-sm">
-          <div className="w-full max-w-md bg-slate-900 border-l border-slate-800 h-full p-6 shadow-2xl flex flex-col space-y-6">
-            <div className="flex items-center justify-between border-b border-slate-800 pb-4">
-              <div className="flex items-center gap-2">
-                <Table className="h-5 w-5 text-blue-400" />
-                <h3 className="text-lg font-semibold text-slate-100">Live Database Schema</h3>
-              </div>
-              <button
-                onClick={() => setIsSchemaDrawerOpen(false)}
-                className="p-1 text-slate-400 hover:text-slate-100 hover:bg-slate-800 rounded transition"
-                aria-label="Close Schema Drawer"
-              >
-                <X className="h-5 w-5" />
-              </button>
-            </div>
+      <section className="relative mx-auto max-w-3xl px-8 pb-20 pt-20 text-center">
+        <Image src="/logo-icon.png" alt="" width={72} height={72} className="mx-auto rounded-lg" />
+        <p className="mt-3 font-mono text-[11px] uppercase tracking-[0.2em] text-slate-500">Data in motion. Insights in real time.</p>
+        <h1 className="mt-4 text-4xl font-extrabold tracking-tight sm:text-5xl">
+          From plain-English intent to <span className="bg-gradient-to-r from-cyan-400 to-violet-400 bg-clip-text text-transparent">reviewed, scheduled pipelines</span>
+        </h1>
+        <p className="mx-auto mt-6 max-w-xl text-sm leading-relaxed text-slate-400">
+          Describe a data pipeline goal. AI writes it, tests it in a sandbox, and self-heals real bugs -
+          but nothing ever touches your real data until a human reviews and approves it.
+        </p>
 
-            <div className="space-y-3">
-              <div className="relative">
-                <Search className="h-4 w-4 text-slate-500 absolute left-3 top-2.5" />
-                <input
-                  type="text"
-                  placeholder="Filter tables..."
-                  value={schemaSearch}
-                  onChange={(e) => setSchemaSearch(e.target.value)}
-                  className="w-full bg-slate-950 border border-slate-800 rounded-lg pl-9 pr-3 py-1.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-blue-500 transition"
-                />
-              </div>
-
-              <div className="flex items-center justify-between bg-slate-950 p-3 rounded-lg border border-slate-800">
-                <span className="text-xs text-slate-300 font-medium">Hide System Tables</span>
-                <button
-                  onClick={() => setHideDltTables(!hideDltTables)}
-                  className={`p-1.5 rounded-md border transition ${hideDltTables
-                    ? 'bg-blue-950 border-blue-800 text-blue-400'
-                    : 'bg-slate-900 border-slate-800 text-slate-500'
-                    }`}
-                  aria-label="Toggle System Tables Visibility"
-                >
-                  {hideDltTables ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                </button>
-              </div>
-            </div>
-
-            <div className="flex-1 overflow-y-auto space-y-6 pr-2">
-              {filteredSchema.length === 0 ? (
-                <p className="text-xs text-slate-500">No matching tables found in database.</p>
-              ) : (
-                filteredSchema.map(([tableName, columns]) => (
-                  <div key={tableName} className="bg-slate-950 border border-slate-800 rounded-lg p-4 space-y-3">
-                    <div className="flex items-center justify-between border-b border-slate-800/60 pb-2">
-                      <span className="font-mono text-sm font-semibold text-blue-400">
-                        {tableName}
-                      </span>
-                      <button
-                        onClick={() => insertMetadataIntoGoal(tableName)}
-                        className="flex items-center gap-1 text-[11px] text-slate-400 hover:text-blue-400 transition"
-                      >
-                        <PlusCircle className="h-3.5 w-3.5" />
-                        Insert
-                      </button>
-                    </div>
-                    <ul className="space-y-1.5 text-xs font-mono text-slate-300">
-                      {columns.map((col, idx) => (
-                        <li
-                          key={`${tableName}-${col.column_name}-${idx}`}
-                          onClick={() => insertMetadataIntoGoal(col.column_name)}
-                          className="flex justify-between items-center p-1 rounded hover:bg-slate-900 cursor-pointer transition group"
-                        >
-                          <span className="group-hover:text-blue-300">{col.column_name}</span>
-                          <span className="text-slate-500 text-[10px] bg-slate-900 group-hover:bg-slate-800 px-2 py-0.5 rounded border border-slate-800">
-                            {col.data_type}
-                          </span>
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                ))
-              )}
-            </div>
-          </div>
+        <div className="mx-auto mt-8 max-w-md rounded-xl border border-slate-800 bg-slate-900/60 px-6 py-4">
+          <p className="font-mono text-sm italic text-violet-300">&ldquo;Describe the pipeline. Review what it builds. Ship it.&rdquo;</p>
         </div>
-      )}
+
+        <div className="mt-10 flex items-center justify-center gap-3">
+          <SignUpButton forceRedirectUrl="/projects">
+            <button className="inline-flex items-center gap-1.5 rounded-lg bg-cyan-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-cyan-500">
+              Get started <ArrowRight className="h-4 w-4" />
+            </button>
+          </SignUpButton>
+          <Link href="/sign-in" className="rounded-lg border border-slate-700 px-5 py-2.5 text-sm font-semibold text-slate-300 hover:bg-slate-900">
+            Sign in
+          </Link>
+        </div>
+      </section>
+
+      <section className="relative mx-auto max-w-5xl px-8 pb-24">
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {features.map((f) => (
+            <div key={f.title} className={`rounded-xl border bg-slate-900 p-5 ${f.bg.split(' ')[1]}`}>
+              <div className={`mb-3 inline-flex h-9 w-9 items-center justify-center rounded-lg border ${f.bg}`}>
+                <f.icon className={`h-4.5 w-4.5 ${f.color}`} />
+              </div>
+              <h3 className="text-sm font-semibold text-slate-100">{f.title}</h3>
+              <p className="mt-1.5 text-xs leading-relaxed text-slate-400">{f.body}</p>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <footer className="relative border-t border-slate-800 py-6 text-center text-[11px] text-slate-500">
+        9Gear Pulse - AI-Reviewed ETL Pipeline Platform
+      </footer>
     </main>
   );
 }

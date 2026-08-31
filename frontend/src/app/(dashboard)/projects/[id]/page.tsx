@@ -1,0 +1,166 @@
+'use client';
+
+import { FormEvent, useEffect, useState } from 'react';
+import Link from 'next/link';
+import { useAuth } from '@clerk/nextjs';
+import { Database, ArrowRight } from 'lucide-react';
+
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
+
+interface Project {
+  id: string;
+  name: string;
+  goal_description: string;
+  status: string;
+}
+
+interface PipelineSummary {
+  id: string;
+  status: string;
+  version: number;
+}
+
+interface ConnectionOption {
+  id: string;
+  name: string;
+}
+
+function getErrorMessage(payload: unknown): string {
+  if (typeof payload === 'object' && payload && 'detail' in payload) {
+    return String((payload as { detail: unknown }).detail);
+  }
+  return 'The request could not be completed.';
+}
+
+export default function ProjectDetailPage(props: PageProps<'/projects/[id]'>) {
+  const { getToken } = useAuth();
+  const [projectId, setProjectId] = useState<string | null>(null);
+  const [project, setProject] = useState<Project | null>(null);
+  const [pipelines, setPipelines] = useState<PipelineSummary[]>([]);
+  const [profiles, setProfiles] = useState<ConnectionOption[]>([]);
+  const [sourceId, setSourceId] = useState('');
+  const [destinationId, setDestinationId] = useState('');
+  const [message, setMessage] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+
+  const authHeaders = async (): Promise<HeadersInit> => {
+    const token = await getToken();
+    if (!token) throw new Error('You need to be signed in to do that.');
+    return { Authorization: `Bearer ${token}` };
+  };
+
+  const load = async (id: string) => {
+    try {
+      const headers = await authHeaders();
+      const [projectRes, pipelinesRes, profilesRes] = await Promise.all([
+        fetch(`${API_BASE_URL}/api/v2/projects/${id}`, { headers }),
+        fetch(`${API_BASE_URL}/api/v2/projects/${id}/pipelines`, { headers }),
+        fetch(`${API_BASE_URL}/api/v2/connection-profiles`, { headers }),
+      ]);
+      const projectData: unknown = await projectRes.json();
+      const pipelinesData: unknown = await pipelinesRes.json();
+      const profilesData: unknown = await profilesRes.json();
+      if (!projectRes.ok) throw new Error(getErrorMessage(projectData));
+      if (!pipelinesRes.ok) throw new Error(getErrorMessage(pipelinesData));
+      if (!profilesRes.ok) throw new Error(getErrorMessage(profilesData));
+      setProject(projectData as Project);
+      setPipelines((pipelinesData as { pipelines: PipelineSummary[] }).pipelines || []);
+      setProfiles((profilesData as { connection_profiles: ConnectionOption[] }).connection_profiles || []);
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : 'Failed to load project.');
+    }
+  };
+
+  // Page components with dynamic segments receive params as a Promise in
+  // this Next.js version - resolved once on mount, then used for every
+  // subsequent load() call (e.g. after creating a new pipeline).
+  useEffect(() => {
+    void props.params.then(({ id }) => {
+      setProjectId(id);
+      void load(id);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const createPipeline = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!projectId) return;
+    setCreating(true);
+    setMessage(null);
+    try {
+      const headers = await authHeaders();
+      const res = await fetch(`${API_BASE_URL}/api/v2/pipelines`, {
+        method: 'POST',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          project_id: projectId,
+          source_connection_id: sourceId,
+          destination_connection_id: destinationId,
+          generated_code: '# Draft pipeline. Generate and sandbox-test this version before approval.\n',
+        }),
+      });
+      const data: unknown = await res.json();
+      if (!res.ok) throw new Error(getErrorMessage(data));
+      setMessage('Draft pipeline created below - open it to introspect the source, then generate and test it.');
+      await load(projectId);
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : 'Failed to create pipeline.');
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  if (!project) {
+    return <p className="text-xs text-slate-500">{message || 'Loading project...'}</p>;
+  }
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-lg font-semibold text-slate-100">{project.name}</h1>
+        <p className="mt-1 text-xs text-slate-400">{project.goal_description}</p>
+      </div>
+
+      <section className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-xl space-y-4">
+        <h2 className="text-sm font-semibold flex items-center gap-2"><Database className="h-4 w-4 text-cyan-400" /> New draft pipeline</h2>
+        <form onSubmit={createPipeline} className="grid gap-3 md:grid-cols-[1fr_1fr_auto] rounded-lg border border-slate-800 bg-slate-950 p-4">
+          <select required value={sourceId} onChange={(e) => setSourceId(e.target.value)}
+            className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 focus:border-cyan-500 focus:outline-none">
+            <option value="">Source profile</option>
+            {profiles.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+          <select required value={destinationId} onChange={(e) => setDestinationId(e.target.value)}
+            className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 focus:border-cyan-500 focus:outline-none">
+            <option value="">Destination profile</option>
+            {profiles.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+          <button type="submit" disabled={creating}
+            className="rounded-lg bg-cyan-600 px-4 py-2 text-xs font-semibold text-white hover:bg-cyan-500 disabled:opacity-50">
+            Create draft
+          </button>
+        </form>
+        {message && <p className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-300">{message}</p>}
+      </section>
+
+      <section className="space-y-2">
+        {pipelines.length === 0 ? (
+          <p className="text-xs text-slate-500">No pipelines in this project yet - create one above.</p>
+        ) : (
+          pipelines.map((pipeline) => (
+            <Link
+              key={pipeline.id}
+              href={`/pipelines/${pipeline.id}`}
+              className="flex items-center justify-between gap-3 rounded-lg border border-slate-800 bg-slate-900 p-4 hover:border-violet-800"
+            >
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-semibold text-slate-100">v{pipeline.version}</span>
+                <span className="rounded-full border border-slate-700 bg-slate-950 px-2 py-0.5 text-[10px] uppercase tracking-wide text-slate-400">{pipeline.status}</span>
+              </div>
+              <ArrowRight className="h-4 w-4 shrink-0 text-slate-600" />
+            </Link>
+          ))
+        )}
+      </section>
+    </div>
+  );
+}
