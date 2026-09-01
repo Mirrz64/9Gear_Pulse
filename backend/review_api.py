@@ -31,6 +31,7 @@ from models import (
     PipelineRun,
     PipelineStatus,
     PipelineVersion,
+    PipelineVersionFile,
     PipelineVersionReviewStatus,
     Project,
     RunStatus,
@@ -363,6 +364,24 @@ def approve_architecture(version_id: uuid.UUID, body: ReviewRequest, db: Session
     if version.architecture_status != ArchitectureStatus.pending_review:
         raise HTTPException(status_code=409, detail="Only an architecture proposal awaiting review can be approved")
     version.architecture_status = ArchitectureStatus.approved
+
+    # Stage B: the approved plan's file-by-file build order is
+    # materialized as real rows right here - locked in at approval
+    # time, only each file's generated_code and review_status move
+    # from this point on. Empty when the proposal had no files (or was
+    # a pre-Stage-B single-file plan), leaving the whole-pipeline
+    # generate endpoint as the path that runs.
+    proposed_files = (version.architecture_proposal or {}).get("files") or []
+    for i, pf in enumerate(proposed_files, start=1):
+        db.add(PipelineVersionFile(
+            pipeline_version_id=version.id,
+            file_order=i,
+            file_name=pf["file_name"],
+            purpose=pf["purpose"],
+            reads_from=pf.get("reads_from", []),
+            destination_table=pf["destination_table"],
+        ))
+
     # Reuses PipelineReview/AuditLog rather than a new table - a known,
     # deliberate simplification for this first pass: nothing currently
     # distinguishes an architecture-review row from a code-review row
@@ -373,7 +392,7 @@ def approve_architecture(version_id: uuid.UUID, body: ReviewRequest, db: Session
                           action=PipelineReviewAction.approved, comment=body.comment))
     _audit(db, current_user.id, "pipeline_version.architecture_approved", "pipeline_version", version.id)
     db.commit()
-    return {"version_id": version.id, "architecture_status": "approved"}
+    return {"version_id": version.id, "architecture_status": "approved", "file_count": len(proposed_files)}
 
 
 @router.post("/pipeline-versions/{version_id}/reject-architecture")
@@ -410,6 +429,15 @@ def generate_and_test_pipeline(pipeline_id: uuid.UUID, body: GenerateRequest, db
         raise HTTPException(
             status_code=409,
             detail="Propose and approve an architecture for this pipeline before generating code.",
+        )
+    if current_version.files:
+        # This version's approved plan has a real file-by-file build
+        # order - generating one combined script here would bypass it
+        # entirely. /pipeline-version-files/{id}/generate is the path
+        # for a multi-file version, one file at a time.
+        raise HTTPException(
+            status_code=409,
+            detail="This pipeline has a multi-file build plan - generate each file individually instead.",
         )
 
     # If the most recent review on this pipeline was a rejection, fold the
@@ -513,6 +541,221 @@ def generate_and_test_pipeline(pipeline_id: uuid.UUID, body: GenerateRequest, db
             "review_status": version.review_status, "sandbox_success": success}
 
 
+@router.post("/pipeline-version-files/{file_id}/generate")
+def generate_and_test_file(file_id: uuid.UUID, body: GenerateRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Generate code for ONE file in a multi-file version's approved
+    build plan, sandbox-test it, and persist evidence - mirrors
+    generate_and_test_pipeline exactly, scoped to a single file instead
+    of a whole pipeline. execute_with_self_healing already operates on
+    one script at a time internally, so it's reused here completely
+    unchanged - it never mattered whether that script was "the whole
+    pipeline" or "one file within it".
+    """
+    file = db.scalar(select(PipelineVersionFile).where(PipelineVersionFile.id == file_id).with_for_update())
+    if file is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    version = _owned_version(db, file.pipeline_version_id, current_user.id, lock=True)
+    pipeline = _owned_pipeline(db, version.pipeline_id, current_user.id, lock=True)
+
+    # Strict ordering: file N can only depend on file N-1's destination
+    # table genuinely existing, which requires N-1 to already be
+    # approved. Not just a UX nicety - this is what lets each file be
+    # tested standalone against real, materialized upstream data.
+    earlier_unapproved = db.scalar(
+        select(PipelineVersionFile.id).where(
+            PipelineVersionFile.pipeline_version_id == version.id,
+            PipelineVersionFile.file_order < file.file_order,
+            PipelineVersionFile.review_status != PipelineVersionReviewStatus.approved,
+        ).limit(1)
+    )
+    if earlier_unapproved is not None:
+        raise HTTPException(status_code=409, detail="An earlier file in this build plan hasn't been approved yet")
+    if file.review_status not in (PipelineVersionReviewStatus.draft, PipelineVersionReviewStatus.testing, PipelineVersionReviewStatus.rejected):
+        raise HTTPException(status_code=409, detail="This file has already been generated and is awaiting review, or is finalized")
+
+    source = db.get(ConnectionProfile, pipeline.source_connection_id)
+    destination = db.get(ConnectionProfile, pipeline.destination_connection_id)
+    if source is None or destination is None:
+        raise HTTPException(status_code=409, detail="Pipeline connection profile is missing")
+    if not source.schema_metadata_json:
+        raise HTTPException(status_code=409, detail="Introspect the source connection before generating a pipeline")
+
+    pipeline.status = PipelineStatus.testing
+
+    try:
+        source_url, destination_url = postgres_url(source), postgres_url(destination)
+    except CredentialResolutionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    # Files after the first may read an EARLIER file's destination
+    # table - not something the original source schema knows about.
+    # Introspecting the real destination here (which, by construction,
+    # only contains earlier APPROVED files' actual output at this
+    # point) gives generation and self-healing real column-level truth
+    # instead of just a table-name reference.
+    schema_for_generation = dict(source.schema_metadata_json)
+    if file.file_order > 1:
+        try:
+            schema_for_generation.update(introspect_schema(db_url=destination_url, sample_rows=0))
+        except Exception as exc:
+            print(f"[Warning] Could not introspect destination for upstream file context: {exc}")
+
+    file_goal = (
+        f"{pipeline.project.goal_description}\n\n"
+        f"You are generating ONE file within an approved multi-file build plan: "
+        f"'{file.file_name}'. Purpose: {file.purpose}. This file must read ONLY "
+        f"from: {', '.join(file.reads_from) or '(the original source only)'}. "
+        f"Write its output to a table named exactly '{file.destination_table}'. "
+        f"Do not implement any other file's purpose - only this one."
+    )
+    latest_rejection = db.scalar(
+        select(PipelineReview)
+        .where(
+            PipelineReview.pipeline_version_file_id == file.id,
+            PipelineReview.action == PipelineReviewAction.rejected,
+        )
+        .order_by(PipelineReview.created_at.desc())
+        .limit(1)
+    )
+    if latest_rejection and latest_rejection.comment:
+        file_goal = (
+            f"{file_goal}\n\nA previous attempt at this specific file was rejected "
+            f"during human review with this feedback - address it in this attempt:\n"
+            f"{latest_rejection.comment}"
+        )
+
+    from generate_pipeline import generate_pipeline
+    try:
+        generated = generate_pipeline(schema_for_generation, file_goal)
+        code = generated.get("code")
+        if not code:
+            raise ValueError("AI response did not include pipeline code")
+    except Exception as exc:
+        _audit(db, current_user.id, "pipeline_version_file.generation_failed", "pipeline_version_file", file.id)
+        db.commit()
+        raise HTTPException(status_code=502, detail=f"File generation failed: {exc}") from exc
+
+    file.generated_code = code
+    file.review_status = PipelineVersionReviewStatus.testing
+    db.flush()
+
+    started_at = datetime.now(timezone.utc)
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", encoding="utf-8", delete=False) as script:
+            script.write(code)
+            script_path = script.name
+        try:
+            from heal_pipeline import execute_with_self_healing
+            success, attempts, logs = execute_with_self_healing(
+                script_path, schema_for_generation, body.max_retries, source_url, destination_url
+            )
+        finally:
+            os.unlink(script_path)
+    except Exception as exc:
+        success, attempts = False, 0
+        logs = f"Unexpected error during sandbox test: {exc}"
+
+    quality_result = None
+    row_count = None
+    if success:
+        try:
+            from data_quality import run_quality_checks
+            quality_result = run_quality_checks(
+                destination_url, generated.get("destination_dataset", ""), file.destination_table,
+            )
+            row_count = quality_result.get("row_count")
+        except Exception as exc:
+            quality_result = {"checked": False, "reason": f"Quality check itself failed: {exc}"}
+
+    run = PipelineRun(pipeline_id=pipeline.id, pipeline_version_id=version.id,
+                      pipeline_version_file_id=file.id,
+                      status=RunStatus.success if success else RunStatus.failed,
+                      started_at=started_at, finished_at=datetime.now(timezone.utc),
+                      log_output=logs if success else None, error_output=None if success else logs,
+                      row_count=row_count, quality_checks=quality_result)
+    db.add(run)
+    file.review_status = PipelineVersionReviewStatus.pending_review if success else PipelineVersionReviewStatus.testing
+    _audit(db, current_user.id,
+           "pipeline_version_file.ready_for_review" if success else "pipeline_version_file.test_failed",
+           "pipeline_version_file", file.id)
+    db.commit()
+    return {"file_id": file.id, "attempts": attempts, "review_status": file.review_status, "sandbox_success": success}
+
+
+@router.post("/pipeline-version-files/{file_id}/approve")
+def approve_file(file_id: uuid.UUID, body: ReviewRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    file = db.scalar(select(PipelineVersionFile).where(PipelineVersionFile.id == file_id).with_for_update())
+    if file is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    version = _owned_version(db, file.pipeline_version_id, current_user.id, lock=True)
+
+    successful_run = db.scalar(select(PipelineRun.id).where(
+        PipelineRun.pipeline_version_file_id == file.id, PipelineRun.status == RunStatus.success
+    ))
+    if file.review_status != PipelineVersionReviewStatus.pending_review or successful_run is None:
+        raise HTTPException(status_code=409, detail="A successful sandbox test is required before approving this file")
+
+    file.review_status = PipelineVersionReviewStatus.approved
+    file.reviewed_by = current_user.id
+    file.reviewed_at = datetime.now(timezone.utc)
+    db.add(PipelineReview(pipeline_version_id=version.id, pipeline_version_file_id=file.id,
+                          actor_id=current_user.id, action=PipelineReviewAction.approved, comment=body.comment))
+    _audit(db, current_user.id, "pipeline_version_file.approved", "pipeline_version_file", file.id)
+
+    # Without this, the remaining-files check below can run before this
+    # file's own status change has actually reached the database (it
+    # selects a bare id column, not the full ORM row, so it queries the
+    # database directly rather than seeing the in-memory change) -
+    # incorrectly finding THIS file as still "remaining" and never
+    # flipping the whole version once it was genuinely the last one.
+    db.flush()
+
+    # If this was the last unapproved file, the whole version is ready
+    # for final sign-off - mirrors generate_and_test_pipeline's own
+    # success path (review_status -> pending_review). Concatenating
+    # every file's code into generated_code means the existing whole-
+    # version approve/schedule endpoints (unchanged) have something
+    # real to display and pin, without needing to know anything about
+    # multi-file versions themselves.
+    remaining = db.scalar(
+        select(PipelineVersionFile.id).where(
+            PipelineVersionFile.pipeline_version_id == version.id,
+            PipelineVersionFile.review_status != PipelineVersionReviewStatus.approved,
+        ).limit(1)
+    )
+    if remaining is None:
+        all_files = list(db.scalars(
+            select(PipelineVersionFile).where(PipelineVersionFile.pipeline_version_id == version.id)
+            .order_by(PipelineVersionFile.file_order)
+        ))
+        version.generated_code = "\n\n".join(
+            f"# --- {f.file_name} ({f.purpose}) ---\n{f.generated_code}" for f in all_files
+        )
+        version.review_status = PipelineVersionReviewStatus.pending_review
+        version.pipeline.generated_code = version.generated_code
+
+    db.commit()
+    return {"file_id": file.id, "review_status": "approved", "all_files_approved": remaining is None}
+
+
+@router.post("/pipeline-version-files/{file_id}/reject")
+def reject_file(file_id: uuid.UUID, body: ReviewRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    file = db.scalar(select(PipelineVersionFile).where(PipelineVersionFile.id == file_id).with_for_update())
+    if file is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    version = _owned_version(db, file.pipeline_version_id, current_user.id, lock=True)
+    if file.review_status != PipelineVersionReviewStatus.pending_review:
+        raise HTTPException(status_code=409, detail="Only a file awaiting review can be rejected")
+    file.review_status = PipelineVersionReviewStatus.rejected
+    file.reviewed_by = current_user.id
+    file.reviewed_at = datetime.now(timezone.utc)
+    db.add(PipelineReview(pipeline_version_id=version.id, pipeline_version_file_id=file.id,
+                          actor_id=current_user.id, action=PipelineReviewAction.rejected, comment=body.comment))
+    _audit(db, current_user.id, "pipeline_version_file.rejected", "pipeline_version_file", file.id)
+    db.commit()
+    return {"file_id": file.id, "review_status": "rejected"}
+
+
 @router.get("/pipelines/{pipeline_id}/review")
 def get_review(pipeline_id: uuid.UUID, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     pipeline = _owned_pipeline(db, pipeline_id, current_user.id)
@@ -529,6 +772,25 @@ def get_review(pipeline_id: uuid.UUID, db: Session = Depends(get_db), current_us
     reviews = list(db.scalars(
         select(PipelineReview).where(PipelineReview.pipeline_version_id == current.id).order_by(PipelineReview.created_at.desc())
     ))
+    files = list(db.scalars(
+        select(PipelineVersionFile).where(PipelineVersionFile.pipeline_version_id == current.id)
+        .order_by(PipelineVersionFile.file_order)
+    ))
+    files_payload = []
+    for f in files:
+        file_runs = list(db.scalars(
+            select(PipelineRun).where(PipelineRun.pipeline_version_file_id == f.id).order_by(PipelineRun.started_at.desc())
+        ))
+        files_payload.append({
+            "id": f.id, "file_order": f.file_order, "file_name": f.file_name,
+            "purpose": f.purpose, "reads_from": f.reads_from,
+            "destination_table": f.destination_table, "generated_code": f.generated_code,
+            "review_status": f.review_status,
+            "runs": [{"id": r.id, "status": r.status, "started_at": r.started_at,
+                      "finished_at": r.finished_at, "log_output": r.log_output,
+                      "error_output": r.error_output, "row_count": r.row_count,
+                      "quality_checks": r.quality_checks} for r in file_runs],
+        })
     return {
         "pipeline": {"id": pipeline.id, "status": pipeline.status, "current_version": pipeline.version},
         "version": {
@@ -546,6 +808,7 @@ def get_review(pipeline_id: uuid.UUID, db: Session = Depends(get_db), current_us
                   "quality_checks": run.quality_checks} for run in runs],
         "review_history": [{"id": review.id, "actor_id": review.actor_id, "action": review.action,
                             "comment": review.comment, "created_at": review.created_at} for review in reviews],
+        "files": files_payload,
     }
 
 

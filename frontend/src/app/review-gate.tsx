@@ -32,6 +32,13 @@ interface ReviewRecord {
   created_at: string;
 }
 
+interface ProposedFile {
+  file_name: string;
+  purpose: string;
+  reads_from: string[];
+  destination_table: string;
+}
+
 interface ArchitectureProposal {
   feasible: boolean;
   feasibility_notes: string;
@@ -42,6 +49,19 @@ interface ArchitectureProposal {
   approach: string | null;
   key_transformations: string[];
   assumptions: string[];
+  files: ProposedFile[];
+}
+
+interface VersionFile {
+  id: string;
+  file_order: number;
+  file_name: string;
+  purpose: string;
+  reads_from: string[];
+  destination_table: string;
+  generated_code: string | null;
+  review_status: string;
+  runs: Run[];
 }
 
 interface ReviewPayload {
@@ -58,6 +78,7 @@ interface ReviewPayload {
   };
   runs: Run[];
   review_history: ReviewRecord[];
+  files: VersionFile[];
 }
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
@@ -93,6 +114,7 @@ export default function ReviewGate({ context }: { context?: { pipelineId: string
   const [review, setReview] = useState<ReviewPayload | null>(null);
   const [comment, setComment] = useState('');
   const [architectureComment, setArchitectureComment] = useState('');
+  const [fileComment, setFileComment] = useState('');
   const [editedCode, setEditedCode] = useState('');
   const [cronExpression, setCronExpression] = useState('0 2 * * *');
   const [message, setMessage] = useState<string | null>(null);
@@ -238,9 +260,31 @@ export default function ReviewGate({ context }: { context?: { pipelineId: string
     }
   };
 
+  const generateFile = async (fileId: string) => {
+    if (await submit(`/api/v2/pipeline-version-files/${fileId}/generate`, { max_retries: '3' })) {
+      setMessage('File generated and sandbox-tested. Review the result below.');
+    }
+  };
+
+  const approveFile = async (fileId: string) => {
+    if (await submit(`/api/v2/pipeline-version-files/${fileId}/approve`, { comment: fileComment })) {
+      setFileComment('');
+      setMessage('File approved.');
+    }
+  };
+
+  const rejectFile = async (fileId: string) => {
+    if (await submit(`/api/v2/pipeline-version-files/${fileId}/reject`, { comment: fileComment })) {
+      setFileComment('');
+      setMessage('File rejected. Regenerate it to try again.');
+    }
+  };
+
   const canReview = review?.version.review_status === 'pending_review';
   const canSchedule = review?.version.review_status === 'approved' && review?.pipeline.status !== 'scheduled';
   const alreadyScheduled = review?.pipeline.status === 'scheduled';
+  const isMultiFile = (review?.files?.length ?? 0) > 0;
+  const currentFileIndex = review?.files?.findIndex((f) => f.review_status !== 'approved') ?? -1;
 
   return (
     <section className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-xl space-y-5">
@@ -317,6 +361,21 @@ export default function ReviewGate({ context }: { context?: { pipelineId: string
                   </ul>
                 </div>
               )}
+
+              {review.version.architecture_proposal.files.length > 0 && (
+                <div>
+                  <p className="text-[11px] font-semibold text-slate-400">Proposed build plan ({review.version.architecture_proposal.files.length} file{review.version.architecture_proposal.files.length === 1 ? '' : 's'})</p>
+                  <div className="mt-1.5 space-y-1.5">
+                    {review.version.architecture_proposal.files.map((f, i) => (
+                      <div key={i} className="rounded-lg border border-slate-800 bg-slate-900 p-2">
+                        <p className="font-mono text-[11px] font-semibold text-slate-200">{i + 1}. {f.file_name}</p>
+                        <p className="text-[10px] text-slate-400">{f.purpose}</p>
+                        <p className="mt-0.5 text-[10px] text-slate-500">Reads: <span className="font-mono">{f.reads_from.join(', ') || '(source only)'}</span> → Writes: <span className="font-mono">{f.destination_table}</span></p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
@@ -342,6 +401,7 @@ export default function ReviewGate({ context }: { context?: { pipelineId: string
           )}
         </div>
 
+        {!isMultiFile && <>
         <div className="grid gap-4 lg:grid-cols-2">
           <div className="rounded-lg border border-slate-800 bg-slate-950 p-4">
             <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">Current version</p>
@@ -382,6 +442,78 @@ export default function ReviewGate({ context }: { context?: { pipelineId: string
             </div>
           ))}
         </div>
+        </>}
+
+        {isMultiFile && (
+          <div className="space-y-3">
+            <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">Build plan ({review.files.length} file{review.files.length === 1 ? '' : 's'})</p>
+            {review.files.map((file, i) => {
+              const isApproved = file.review_status === 'approved';
+              const isCurrent = i === currentFileIndex;
+              const isLocked = !isApproved && !isCurrent;
+              return (
+                <div key={file.id} className={`rounded-lg border p-4 ${isApproved ? 'border-emerald-800 bg-emerald-950/20' : isCurrent ? 'border-violet-700 bg-slate-950' : 'border-slate-800 bg-slate-950/50 opacity-60'}`}>
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <span className="flex h-5 w-5 items-center justify-center rounded-full border border-slate-600 text-[10px] font-bold text-slate-300">{file.file_order}</span>
+                      <span className="font-mono text-xs font-semibold text-slate-100">{file.file_name}</span>
+                    </div>
+                    <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase ${isApproved ? 'bg-emerald-900 text-emerald-300' : 'bg-slate-800 text-slate-400'}`}>{file.review_status.replace('_', ' ')}</span>
+                  </div>
+                  <p className="mt-1.5 text-[11px] text-slate-400">{file.purpose}</p>
+                  <p className="mt-1 text-[11px] text-slate-500">Reads: <span className="font-mono">{file.reads_from.join(', ') || '(source only)'}</span> → Writes: <span className="font-mono text-slate-300">{file.destination_table}</span></p>
+
+                  {isLocked && <p className="mt-2 text-[11px] italic text-slate-600">Waiting for earlier files to be approved.</p>}
+
+                  {file.generated_code && (
+                    <pre className="mt-3 max-h-56 overflow-auto whitespace-pre-wrap rounded-lg border border-slate-800 bg-slate-900 p-3 font-mono text-[11px] text-emerald-300">{file.generated_code}</pre>
+                  )}
+
+                  {isCurrent && (file.review_status === 'draft' || file.review_status === 'testing' || file.review_status === 'rejected') && (
+                    <button onClick={() => generateFile(file.id)} disabled={busy} className="mt-3 inline-flex items-center gap-1.5 rounded-lg bg-cyan-600 px-3 py-2 text-xs font-semibold text-white hover:bg-cyan-500 disabled:opacity-50">
+                      <Send className="h-3.5 w-3.5" /> {file.review_status === 'testing' || file.review_status === 'rejected' ? 'Retry generate & sandbox test' : 'Generate & sandbox test'}
+                    </button>
+                  )}
+
+                  {isCurrent && file.runs.length > 0 && (
+                    <div className="mt-3 border-t border-slate-800 pt-3">
+                      {file.runs.map((run) => (
+                        <div key={run.id} className="mb-2">
+                          <p className="text-[11px] font-semibold text-slate-300">{run.status} {run.row_count !== null ? `· ${run.row_count} rows` : ''}</p>
+                          <pre className="mt-1 max-h-28 overflow-auto whitespace-pre-wrap font-mono text-[11px] text-slate-400">{run.log_output || run.error_output || 'No output recorded.'}</pre>
+                          {run.quality_checks?.checked && run.quality_checks.warnings && run.quality_checks.warnings.length > 0 && (
+                            <div className="mt-1.5 rounded-lg border border-amber-800 bg-amber-950/40 p-2">
+                              <p className="text-[10px] font-semibold text-amber-400">⚠ Data quality warnings</p>
+                              <ul className="space-y-0.5">
+                                {run.quality_checks.warnings.map((w, wi) => <li key={wi} className="text-[10px] text-amber-300">{w}</li>)}
+                              </ul>
+                            </div>
+                          )}
+                          {run.quality_checks?.checked && (!run.quality_checks.warnings || run.quality_checks.warnings.length === 0) && (
+                            <p className="mt-1 text-[10px] text-emerald-400">✓ No data quality warnings</p>
+                          )}
+                          {run.quality_checks && !run.quality_checks.checked && (
+                            <p className="mt-1 text-[10px] text-amber-300">⚠ Data quality check could not run: {run.quality_checks.reason}</p>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {isCurrent && file.review_status === 'pending_review' && (
+                    <div className="mt-3 space-y-2">
+                      <textarea value={fileComment} onChange={(e) => setFileComment(e.target.value)} placeholder="Why is this file safe to approve, or why is it rejected?" className="h-16 w-full rounded-lg border border-slate-700 bg-slate-900 p-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-violet-500 focus:outline-none" />
+                      <div className="flex gap-2">
+                        <button onClick={() => approveFile(file.id)} disabled={busy} className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-50"><CheckCircle2 className="h-3.5 w-3.5" /> Approve file</button>
+                        <button onClick={() => rejectFile(file.id)} disabled={busy} className="inline-flex items-center gap-1.5 rounded-lg border border-rose-800 bg-rose-950 px-3 py-2 text-xs font-semibold text-rose-300 hover:bg-rose-900 disabled:opacity-50"><XCircle className="h-3.5 w-3.5" /> Reject file</button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
 
         <div className="grid gap-4 lg:grid-cols-2">
           <div className="space-y-2">

@@ -223,6 +223,13 @@ class Pipeline(Base):
 class PipelineVersion(Base):
     """Every generated/edited version of a pipeline's code, so the
     review UI can diff across versions without a retrofit later.
+
+    Single-file (generated_code populated directly) and multi-file
+    (files populated, generated_code left as a placeholder until every
+    file is approved, then set to a concatenated read-only view of all
+    of them) versions coexist - a version is "multi-file" simply if it
+    has any PipelineVersionFile rows, not a separate stored flag that
+    could drift out of sync with reality.
     """
 
     __tablename__ = "pipeline_versions"
@@ -266,6 +273,71 @@ class PipelineVersion(Base):
     reviews: Mapped[list["PipelineReview"]] = relationship(
         back_populates="pipeline_version", cascade="all, delete-orphan"
     )
+    files: Mapped[list["PipelineVersionFile"]] = relationship(
+        back_populates="pipeline_version", cascade="all, delete-orphan",
+        order_by="PipelineVersionFile.file_order",
+    )
+
+
+class PipelineVersionFile(Base):
+    """One file within a multi-file pipeline version (Stage B).
+
+    Files are created all at once, in order, the moment an
+    architecture proposal with a `files` plan is approved - purpose,
+    reads_from, and destination_table come directly from that approved
+    plan and don't change afterward; only generated_code and
+    review_status move as each file is individually generated, sandbox-
+    tested, and reviewed.
+
+    Sequential and materialized by design: file N's reads_from can
+    only be a real source table or an EARLIER file's destination_table
+    in this same version - never a later one. That's what lets each
+    file be sandbox-tested and reviewed on its own, against tables that
+    already genuinely exist, rather than needing the whole pipeline
+    built before any of it can be verified.
+    """
+
+    __tablename__ = "pipeline_version_files"
+    __table_args__ = (
+        UniqueConstraint("pipeline_version_id", "file_order", name="uq_pvf_version_order"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    pipeline_version_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("pipeline_versions.id"), nullable=False, index=True
+    )
+    file_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    file_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    purpose: Mapped[str] = mapped_column(Text, nullable=False)
+    # Real schema table names and/or earlier files' destination_table
+    # values - a list since a later-stage file (e.g. a gold-layer
+    # aggregation) may join more than one upstream table.
+    reads_from: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    destination_table: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Null until this specific file has actually been generated -
+    # distinct from the whole version's generated_code, which stays a
+    # placeholder for a multi-file version until every file is approved.
+    generated_code: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Reuses PipelineVersionReviewStatus (same Python enum, same values:
+    # draft/testing/pending_review/approved/rejected) but a DISTINCT
+    # Postgres enum type name - sharing one Postgres enum type across
+    # two different tables' columns is a known Alembic autogenerate
+    # pitfall (the exact "type already exists" error Stage A's own
+    # migration hit), so this sidesteps that entirely rather than risk
+    # repeating it.
+    review_status: Mapped[PipelineVersionReviewStatus] = mapped_column(
+        SAEnum(PipelineVersionReviewStatus, name="pipeline_version_file_review_status"),
+        default=PipelineVersionReviewStatus.draft,
+        nullable=False,
+    )
+    reviewed_by: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
+    )
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    pipeline_version: Mapped["PipelineVersion"] = relationship(back_populates="files")
+    runs: Mapped[list["PipelineRun"]] = relationship(back_populates="pipeline_version_file")
 
 
 class PipelineRun(Base):
@@ -279,6 +351,14 @@ class PipelineRun(Base):
     # to the exact immutable code version they tested.
     pipeline_version_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), ForeignKey("pipeline_versions.id"), nullable=True, index=True
+    )
+    # Null for single-file versions and for whole-version runs. Set when
+    # this run tested one specific file within a multi-file version -
+    # still ALSO sets pipeline_version_id above, so existing queries
+    # that just check "is there a successful run for this version"
+    # (e.g. the whole-version approve endpoint) keep working unchanged.
+    pipeline_version_file_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("pipeline_version_files.id"), nullable=True, index=True
     )
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -295,6 +375,7 @@ class PipelineRun(Base):
 
     pipeline: Mapped["Pipeline"] = relationship(back_populates="runs")
     pipeline_version: Mapped[Optional["PipelineVersion"]] = relationship(back_populates="runs")
+    pipeline_version_file: Mapped[Optional["PipelineVersionFile"]] = relationship(back_populates="runs")
 
 
 class PipelineReview(Base):
@@ -305,6 +386,13 @@ class PipelineReview(Base):
     id: Mapped[uuid.UUID] = _uuid_pk()
     pipeline_version_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("pipeline_versions.id"), nullable=False, index=True
+    )
+    # Null for a whole-version or architecture review. Set when this
+    # review is about one specific file within a multi-file version -
+    # same reasoning as PipelineRun.pipeline_version_file_id: lets
+    # per-file rejection feedback exist without a separate table.
+    pipeline_version_file_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("pipeline_version_files.id"), nullable=True, index=True
     )
     actor_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=False

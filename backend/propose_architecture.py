@@ -12,6 +12,14 @@ table) got past generation and only surfaced as a sandbox failure or
 a silently-empty destination table, well after real time was spent on
 it. This step is meant to catch that up front instead.
 
+Stage B addition: the proposal now names actual files in build order,
+not just a prose approach. Each file's reads_from must be either a
+real schema table or an EARLIER file's destination_table in this same
+plan - never a later one. That's what makes the plan buildable
+sequentially: file 2 can only depend on a table file 1 will have
+actually materialized by the time file 2 is generated and tested,
+never on something that doesn't exist yet.
+
 Same structured-outputs approach as generate_pipeline.py (each
 provider's native support, not JSON-in-prose), and the same
 max_tokens/thinking-disabled tuning that took real debugging to get
@@ -37,6 +45,16 @@ anthropic_client = anthropic.Anthropic(api_key=anthropic_key) if anthropic_key e
 openai_client = openai.OpenAI(api_key=openai_key) if openai_key else None
 
 
+class ProposedFile(BaseModel):
+    file_name: str
+    purpose: str
+    # Real schema table names and/or earlier files' destination_table
+    # values from this SAME files list - never a later file's, and
+    # never a table not present in the schema or in an earlier file.
+    reads_from: List[str] = Field(default_factory=list)
+    destination_table: str
+
+
 class ArchitectureProposal(BaseModel):
     feasible: bool
     # Required either way - if feasible, briefly why; if not, exactly
@@ -46,17 +64,24 @@ class ArchitectureProposal(BaseModel):
     # Real table names from the provided schema only - the system
     # prompt is explicit that these can't be invented.
     source_tables_used: List[str] = Field(default_factory=list)
+    # The FINAL output of the whole pipeline - matches the last file's
+    # destination_table when files is populated.
     destination_dataset: Optional[str] = None
     destination_table: Optional[str] = None
     approach: Optional[str] = None
     key_transformations: List[str] = Field(default_factory=list)
     assumptions: List[str] = Field(default_factory=list)
+    # The actual build plan, in the order files must be generated,
+    # tested, and reviewed. Empty when feasible is false - there's
+    # nothing to plan around a goal that doesn't match the schema.
+    files: List[ProposedFile] = Field(default_factory=list)
 
 
 SYSTEM_PROMPT = """You are a data pipeline architect. Given a database schema \
 summary and a plain-English goal, assess whether the goal can actually be \
 fulfilled using ONLY the tables and columns present in the schema, and \
-propose a high-level approach - not code, not yet.
+propose a high-level approach and a concrete, file-by-file build plan - not \
+code, not yet.
 
 This is a review checkpoint that happens BEFORE any code gets written, \
 specifically to catch goals that don't match the real data available. Be \
@@ -78,8 +103,25 @@ be fulfilled and why - do not round a partial match up to a full yes.
 If feasible, describe the intended approach in plain language: which real \
 tables you'll read (source_tables_used - actual names from schema_summary, \
 never names you're introducing), what transformation logic will happen \
-(key_transformations), and where the result will be written \
+(key_transformations), and where the final result will be written \
 (destination_dataset and destination_table).
+
+Then break the work into files, listed in the exact order they must be \
+built. Each file writes to its own real, named destination_table - this \
+plan will be built and tested one file at a time, each file's destination \
+table verified to genuinely exist before the next file is allowed to \
+depend on it. Because of that, a file's reads_from list may only contain: \
+real table names from schema_summary, or the destination_table of an \
+EARLIER file in this same files list. Never a later file's table, and \
+never a table you're introducing that isn't backed by the schema or an \
+earlier file's real output.
+
+Most goals need only one file - do not split a simple, single-stage \
+transformation into multiple files for its own sake. Use more than one \
+file only when there's a genuine staging reason to (for example, a \
+distinct cleansing/masking step whose output several later steps will \
+each depend on, or a bronze/silver/gold pattern the goal actually calls \
+for). When in doubt, prefer fewer files.
 
 Do not write any code. This is a plan for a human to review before code \
 generation begins."""
@@ -148,5 +190,10 @@ if __name__ == "__main__":
     print(f"\nSummary: {result['summary']}")
     if result.get("source_tables_used"):
         print(f"Source tables: {', '.join(result['source_tables_used'])}")
-    if result.get("destination_table"):
+    if result.get("files"):
+        print("\nBuild plan:")
+        for f in result["files"]:
+            reads = ", ".join(f["reads_from"]) or "(none)"
+            print(f"  {f['file_name']}: reads [{reads}] -> writes {f['destination_table']}")
+    elif result.get("destination_table"):
         print(f"Destination: {result.get('destination_dataset')}.{result.get('destination_table')}")
