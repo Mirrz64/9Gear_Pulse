@@ -5,15 +5,19 @@ must report their results here; this module is the authority for whether a
 specific code revision may be scheduled.
 """
 import uuid
+import io
 import json
 import os
+import re
 import tempfile
+import zipfile
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from apscheduler.triggers.cron import CronTrigger
 from cryptography.fernet import Fernet
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -914,3 +918,51 @@ def schedule_approved_pipeline(pipeline_id: uuid.UUID, body: ScheduleRequest, db
     db.refresh(schedule)
     register_schedule(db, schedule)
     return {"schedule_id": schedule.id, "pipeline_version_id": version.id, "status": "scheduled"}
+
+
+def _slugify(name: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "_", name.strip().lower()).strip("_")
+    return slug or "pipeline"
+
+
+@router.get("/pipelines/{pipeline_id}/export")
+def export_pipeline(pipeline_id: uuid.UUID, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Download the current version's real code - a single .py for a
+    single-file version, a .zip (one entry per file, named exactly as
+    already shown throughout review - no re-prefixing here) for a
+    multi-file one. Gated on the version genuinely being approved, same
+    principle as scheduling: nothing half-reviewed leaves the system.
+    """
+    pipeline = _owned_pipeline(db, pipeline_id, current_user.id)
+    version = db.scalar(select(PipelineVersion).where(
+        PipelineVersion.pipeline_id == pipeline.id, PipelineVersion.version == pipeline.version
+    ))
+    if version is None or version.review_status != PipelineVersionReviewStatus.approved:
+        raise HTTPException(status_code=409, detail="Only an approved pipeline version can be exported")
+
+    project_slug = _slugify(pipeline.project.name)
+    files = list(db.scalars(
+        select(PipelineVersionFile).where(PipelineVersionFile.pipeline_version_id == version.id)
+        .order_by(PipelineVersionFile.file_order)
+    ))
+
+    _audit(db, current_user.id, "pipeline.exported", "pipeline", pipeline.id)
+    db.commit()
+
+    if files:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in files:
+                zf.writestr(f.file_name, f.generated_code or "")
+        return Response(
+            content=buffer.getvalue(),
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{project_slug}_pipeline.zip"'},
+        )
+
+    return Response(
+        content=version.generated_code,
+        media_type="text/x-python",
+        headers={"Content-Disposition": f'attachment; filename="{project_slug}_pipeline.py"'},
+    )
+

@@ -41,6 +41,13 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Content-Disposition isn't on the browser's default safe list of
+    # response headers readable by cross-origin JavaScript - without
+    # this, fetch() gets null back for it even though the backend sets
+    # it correctly, which is exactly what caused pipeline exports to
+    # download under the frontend's hardcoded fallback name instead of
+    # the real one.
+    expose_headers=["Content-Disposition"],
 )
 # The legacy prototype can still run against its SQLite database. The review
 # gate deliberately appears only when this service is pointed at Postgres.

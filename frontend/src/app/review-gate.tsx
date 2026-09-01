@@ -2,7 +2,7 @@
 
 import { FormEvent, useEffect, useState } from 'react';
 import { useAuth } from '@clerk/nextjs';
-import { CheckCircle2, ClipboardCheck, RefreshCw, Send, XCircle } from 'lucide-react';
+import { CheckCircle2, ClipboardCheck, Download, RefreshCw, Send, XCircle } from 'lucide-react';
 
 interface QualityChecks {
   checked: boolean;
@@ -227,6 +227,45 @@ export default function ReviewGate({ context }: { context?: { pipelineId: string
     if (!review) return;
     if (await submit(`/api/v2/pipelines/${review.pipeline.id}/schedule`, { cron_expression: cronExpression })) {
       setMessage(`Version scheduled with ${cronExpression}.`);
+    }
+  };
+
+  const exportPipeline = async () => {
+    if (!review) return;
+    setBusy(true);
+    setMessage(null);
+    try {
+      const token = await getToken();
+      if (!token) {
+        setMessage('You need to be signed in to do that.');
+        return;
+      }
+      const response = await fetch(`${API_BASE_URL}/api/v2/pipelines/${review.pipeline.id}/export`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!response.ok) {
+        const payload: unknown = await response.json();
+        throw new Error(getErrorMessage(payload));
+      }
+      const blob = await response.blob();
+      // Filename comes from the backend's own Content-Disposition
+      // header (project-slug based, .py or .zip depending on whether
+      // this version is multi-file) - read it rather than guess, so
+      // this never drifts out of sync with what the backend actually
+      // decided to name it.
+      const disposition = response.headers.get('Content-Disposition') || '';
+      const match = disposition.match(/filename="(.+)"/);
+      const filename = match ? match[1] : 'pipeline.py';
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = filename;
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Unable to export this pipeline.');
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -530,6 +569,12 @@ export default function ReviewGate({ context }: { context?: { pipelineId: string
             <button onClick={saveEdit} disabled={busy || !editedCode.trim() || editedCode === review.version.code} className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-xs font-semibold text-slate-200 hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-50"><Send className="h-3.5 w-3.5" /> Save as new version</button>
           </div>
         </div>
+
+        {review.version.review_status === 'approved' && (
+          <button onClick={exportPipeline} disabled={busy} className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-xs font-semibold text-slate-200 hover:bg-slate-700 disabled:opacity-50">
+            <Download className="h-3.5 w-3.5" /> Export code
+          </button>
+        )}
 
         <div className="flex flex-col gap-2 rounded-lg border border-slate-800 bg-slate-950 p-4 sm:flex-row sm:items-end">
           <label className="flex-1 text-xs font-semibold text-slate-300">Approved schedule (five-field cron)<input value={cronExpression} onChange={(event) => setCronExpression(event.target.value)} className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 font-mono text-xs text-slate-100 focus:border-violet-500 focus:outline-none" /></label>
