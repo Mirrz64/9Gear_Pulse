@@ -16,9 +16,12 @@ anthropic>=0.121.0
 dlt>=1.29.1
 docker>=7.2.0
 sqlglot>=30.16.0
+PyYAML>=6.0  # validates generated docker-compose.yml scaffold content
 
 # Scheduling & Environment
 apscheduler>=3.11.3
+celery>=5.5.0
+redis>=5.2.0
 python-dotenv>=1.2.2
 pydantic>=2.13.4
 pydantic-settings>=2.15.0

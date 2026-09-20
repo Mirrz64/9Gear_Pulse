@@ -10,7 +10,7 @@ import { Show, SignInButton, UserButton } from '@clerk/nextjs';
 // afterthought). Prefix matching, not exact match, so dynamic routes like
 // /pipelines/[id] are covered too, not just their static parent path.
 // /setup and anything else without its own nav yet still needs this.
-const DASHBOARD_PREFIXES = ['/connections', '/pipelines', '/projects', '/schedules'];
+const DASHBOARD_PREFIXES = ['/connections', '/home', '/pipelines', '/projects', '/schedules'];
 
 export default function AuthCorner() {
   const pathname = usePathname();

@@ -18,6 +18,16 @@ services:
       timeout: 5s
       retries: 5
 
+  redis:
+    image: redis:7-alpine
+    container_name: 9gear_pulse_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - pulse_net
+
   backend:
     build: ./backend
     container_name: 9gear_pulse_engine
@@ -25,6 +35,7 @@ services:
       - "8000:8000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - uploads_data:/data/uploads
     environment:
       - DOCKER_HOST=unix:///var/run/docker.sock
       - PG_HOST=9gear_pulse_db
@@ -36,6 +47,7 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - RUNNING_IN_DOCKER=true
+      - UPLOADS_DIR=/data/uploads
     networks:
       - pulse_net
     depends_on:
@@ -60,6 +72,8 @@ services:
 
 volumes:
   pgdata:
+  uploads_data:
+  redis_data:
 
 networks:
   pulse_net:

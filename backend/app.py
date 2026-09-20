@@ -3,10 +3,8 @@ import asyncio
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from main import run_end_to_end_pipeline
 from introspect import introspect_schema
 from logger import get_audit_logs
 
@@ -63,15 +61,6 @@ if os.environ.get("DATABASE_URL", "").startswith("postgresql"):
     from clerk_webhooks import router as clerk_webhook_router
     app.include_router(clerk_webhook_router)
 
-class PipelineRequest(BaseModel):
-    goal: str
-    max_retries: int = 3
-
-class ScheduleRequest(BaseModel):
-    goal: str
-    interval_minutes: int = 60
-    max_retries: int = 3
-
 @app.get("/")
 def read_root():
     return {"status": "online", "service": "9Gear Pulse Engine"}
@@ -109,16 +98,15 @@ def get_generated_code():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to read code artifact: {str(e)}")
 
-@app.post("/api/run")
-def trigger_pipeline(payload: PipelineRequest):
-    """Triggers schema introspection, pipeline generation, Docker sandboxing, and audit logging."""
-    try:
-        success = run_end_to_end_pipeline(goal=payload.goal, max_retries=payload.max_retries)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Pipeline orchestrator error: {str(e)}")
-    if not success:
-        raise HTTPException(status_code=500, detail="Pipeline execution or self-healing failed. Check the audit logs for details.")
-    return {"status": "SUCCESS", "goal": payload.goal}
+# /api/run and /api/schedule (unauthenticated, unreviewed pipeline
+# execution/scheduling against the OLD orchestrator in main.py) were
+# removed here - they predate the real review-gated system in
+# review_api.py entirely, bypass it completely, and every current
+# frontend page goes through /api/v2/... exclusively. Keeping a path
+# that skips "only an approved, reviewed version ever runs" undermined
+# that whole principle regardless of whether it happened to be
+# authenticated. /api/schema, /api/code, /api/stream-logs/{job_id}, and
+# /api/logs stay - none of them execute or schedule anything.
 
 @app.get("/api/stream-logs/{job_id}")
 async def stream_pipeline_logs(job_id: str):
@@ -142,44 +130,6 @@ async def stream_pipeline_logs(job_id: str):
 
     return StreamingResponse(log_generator(), media_type="text/event-stream")
 
-@app.post("/api/schedule")
-def schedule_pipeline(payload: ScheduleRequest):
-    """Schedules a pipeline job to run on a background interval."""
-    job_id = f"pipeline_job_{int(payload.interval_minutes)}"
-    
-    # Remove existing job with the same ID if present
-    if scheduler.get_job(job_id):
-        scheduler.remove_job(job_id)
-
-    scheduler.add_job(
-        run_end_to_end_pipeline,
-        'interval',
-        minutes=payload.interval_minutes,
-        id=job_id,
-        kwargs={"goal": payload.goal, "max_retries": payload.max_retries}
-    )
-    
-    return {
-        "status": "SCHEDULED",
-        "job_id": job_id,
-        "interval_minutes": payload.interval_minutes,
-        "goal": payload.goal
-    }
-
-@app.get("/api/schedules")
-def list_schedules():
-    """Lists all active scheduled pipeline background jobs."""
-    jobs = scheduler.get_jobs()
-    active_jobs = [
-        {
-            "id": job.id,
-            "next_run_time": str(job.next_run_time),
-            "trigger": str(job.trigger)
-        }
-        for job in jobs
-    ]
-    return {"schedules": active_jobs}
-
 @app.get("/api/logs")
 def get_execution_logs():
     """Queries audit log records from pipeline_audit_logs."""
@@ -188,17 +138,6 @@ def get_execution_logs():
         return {"logs": logs}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to query audit logs: {str(e)}")
-
-@app.delete("/api/schedule/{job_id}")
-def delete_schedule(job_id: str):
-    """Cancels and removes an active scheduled background job."""
-    job = scheduler.get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Scheduled job not found")
-    
-    scheduler.remove_job(job_id)
-    return {"status": "DELETED", "job_id": job_id}
-
 
 if __name__ == "__main__":
     import uvicorn

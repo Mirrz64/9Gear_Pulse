@@ -37,6 +37,7 @@ from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import (
+    Boolean,
     DateTime,
     Enum as SAEnum,
     ForeignKey,
@@ -73,6 +74,11 @@ class ConnectionType(str, enum.Enum):
     snowflake = "snowflake"
     bigquery = "bigquery"
     s3 = "s3"
+    api = "api"
+    file = "file"
+    redis = "redis"
+    graphql = "graphql"
+    soap = "soap"
 
 
 class PipelineStatus(str, enum.Enum):
@@ -111,6 +117,24 @@ class ArchitectureStatus(str, enum.Enum):
     pending_review = "pending_review"
     approved = "approved"
     rejected = "rejected"
+
+
+class ScaffoldFileType(str, enum.Enum):
+    """Mirrors propose_architecture.py's ScaffoldFile.scaffold_type
+    string values exactly - kept as a real enum here (rather than a
+    plain string column) so a later generation step can dispatch on a
+    closed set of known kinds instead of re-parsing free text. Only
+    the generated=true kinds from an approved proposal ever produce a
+    row in PipelineVersionScaffoldFile - "readme" and "license" are
+    deliberately absent from this enum, since those are planning-only
+    and never get generated or stored as a row at all.
+    """
+    docker_compose = "docker_compose"
+    env_example = "env_example"
+    gitignore = "gitignore"
+    requirements = "requirements"
+    airflow_dag = "airflow_dag"
+    other = "other"
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +203,58 @@ class ConnectionProfile(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     owner: Mapped["User"] = relationship(back_populates="connection_profiles")
+    files: Mapped[list["ConnectionProfileFile"]] = relationship(
+        back_populates="connection_profile", cascade="all, delete-orphan",
+        order_by="ConnectionProfileFile.file_order",
+    )
+
+
+class ConnectionProfileFile(Base):
+    """One uploaded file within a multi-file file-upload connection
+    profile - the same "one row per file" pattern as
+    PipelineVersionFile, so a 5-file dataset is a real, queryable list
+    rather than an array packed into encrypted_credentials.
+
+    Unlike PipelineVersionFile, there's no sequential dependency between
+    files here - every file in a profile is independent and can be
+    introspected/staged in any order. file_order exists purely for
+    stable display ordering (files uploaded in the same request can
+    share an identical created_at timestamp), not an approval gate.
+
+    format is a plain string, not a Postgres enum, deliberately -
+    format is validated in Python (connection_service.py's
+    _validate_file_shape) rather than at the DB level, sidestepping the
+    exact "Alembic autogenerate misses enum additions" friction this
+    project has already hit twice. Adding a new supported format later
+    (TSV, Parquet) needs no migration.
+
+    connection_profiles.encrypted_credentials stays NOT NULL and holds
+    an encrypted empty dict for file-type profiles - the real per-file
+    data lives here instead, but every profile still decrypts through
+    the same code path with no NULL-branch special case.
+    """
+
+    __tablename__ = "connection_profile_files"
+    __table_args__ = (
+        UniqueConstraint("connection_profile_id", "file_order", name="uq_cpf_profile_order"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    connection_profile_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("connection_profiles.id"), nullable=False, index=True
+    )
+    file_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    # The name introspect_files() keys its output by, and what the
+    # generated pipeline code references under SOURCE_FILES_DIR - must
+    # be preserved exactly as uploaded, not renamed to avoid on-disk
+    # collisions (storage_path handles that instead).
+    original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    storage_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    format: Mapped[str] = mapped_column(String(20), nullable=False)
+    size_bytes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    connection_profile: Mapped["ConnectionProfile"] = relationship(back_populates="files")
 
 
 class Pipeline(Base):
@@ -257,6 +333,19 @@ class PipelineVersion(Base):
     architecture_status: Mapped[Optional[ArchitectureStatus]] = mapped_column(
         SAEnum(ArchitectureStatus, name="architecture_status"), nullable=True
     )
+    # Opt-in, not a replacement of the default flow - when True, each
+    # file's destination schema (CREATE TABLE, with real columns/types/
+    # constraints) must be independently proposed, reviewed, and
+    # actually applied to the real destination BEFORE that file's
+    # transformation code is generated, and generated code is then
+    # constrained to that already-approved schema (dlt's
+    # schema_contract={"columns": "freeze"}) rather than being free to
+    # define its own columns on every regeneration. Set once, at
+    # architecture-proposal time; every existing pipeline predates this
+    # column and defaults to False, meaning completely unchanged
+    # behavior - this never retroactively applies to anything already
+    # built this way.
+    uses_pinned_schema: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     review_status: Mapped[PipelineVersionReviewStatus] = mapped_column(
         SAEnum(PipelineVersionReviewStatus, name="pipeline_version_review_status"),
         default=PipelineVersionReviewStatus.draft,
@@ -266,6 +355,22 @@ class PipelineVersion(Base):
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
     )
     reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Deliberately separate from review_status, not folded into it.
+    # review_status's "testing" value already means two different real
+    # things depending on when you look - "a background task is
+    # actively working on this right now" and "the last attempt
+    # finished and failed, ready for a retry" - and that ambiguity was
+    # always harmless while generation ran synchronously inside one
+    # HTTP request, since the response itself was what told the caller
+    # an attempt was over. Once generation runs in a separate Celery
+    # worker, the frontend has nothing else to watch - it needs an
+    # unambiguous signal for "is something running right now", not an
+    # overloaded reading of a status value that already means something
+    # else. Set True by the endpoint before dispatching the task, and
+    # set False by the task in a finally block, so a worker crashing
+    # unexpectedly can never leave a version stuck showing "in
+    # progress" forever.
+    generation_in_progress: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     pipeline: Mapped["Pipeline"] = relationship(back_populates="versions")
@@ -276,6 +381,9 @@ class PipelineVersion(Base):
     files: Mapped[list["PipelineVersionFile"]] = relationship(
         back_populates="pipeline_version", cascade="all, delete-orphan",
         order_by="PipelineVersionFile.file_order",
+    )
+    scaffold_files: Mapped[list["PipelineVersionScaffoldFile"]] = relationship(
+        back_populates="pipeline_version", cascade="all, delete-orphan",
     )
 
 
@@ -308,12 +416,60 @@ class PipelineVersionFile(Base):
     )
     file_order: Mapped[int] = mapped_column(Integer, nullable=False)
     file_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Where this file conceptually sits in the exported project tree -
+    # null for the project root, otherwise a folder name (e.g. "src").
+    # Carried over from the approved proposal's own ProposedFile.directory
+    # - purely a display/export placement hint, same as ScaffoldFile.path's
+    # folder prefix. file_name itself stays a bare filename throughout;
+    # generation, the sandbox, and everything that reads file_name
+    # directly is untouched by this.
+    directory: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     purpose: Mapped[str] = mapped_column(Text, nullable=False)
     # Real schema table names and/or earlier files' destination_table
     # values - a list since a later-stage file (e.g. a gold-layer
     # aggregation) may join more than one upstream table.
     reads_from: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     destination_table: Mapped[str] = mapped_column(String(255), nullable=False)
+    # All three null unless this file's version has uses_pinned_schema
+    # set - the normal, unchanged case for every pipeline that predates
+    # this feature and every one that doesn't opt into it.
+    #
+    # schema_ddl: the proposed/approved CREATE TABLE statement for this
+    # file's destination_table, generated by propose_file_schema.py -
+    # deliberately its own, separate AI call from generate_pipeline.py,
+    # reviewed and approved on its own before any transformation code
+    # exists at all.
+    #
+    # schema_review_status: its own review track, genuinely independent
+    # of review_status below (which tracks the CODE once schema
+    # approval unlocks generating it) - a file isn't done until both
+    # are approved, not just one. Reuses PipelineVersionReviewStatus's
+    # values but needs its own distinct Postgres enum type name, same
+    # reasoning already documented on review_status just below: sharing
+    # one Postgres enum type across multiple columns is a known Alembic
+    # autogenerate pitfall this project has already hit once before.
+    #
+    # schema_applied_at: set only once schema_ddl has actually been
+    # executed against the real destination - approving the schema
+    # isn't just a status flip, it's the table genuinely coming into
+    # existence with exactly that structure. Null here (even with
+    # schema_review_status already "approved") means the CREATE TABLE
+    # itself hasn't actually run yet or failed - never assumed to have
+    # silently succeeded.
+    schema_ddl: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    schema_review_status: Mapped[Optional[PipelineVersionReviewStatus]] = mapped_column(
+        SAEnum(PipelineVersionReviewStatus, name="pipeline_version_file_schema_review_status"),
+        nullable=True,
+    )
+    schema_applied_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # The latest schema-specific rejection comment - a genuinely
+    # separate feedback track from the code review's own comments
+    # (which live in PipelineReview, keyed by pipeline_version_file_id
+    # with no way to distinguish "this was about the schema" from
+    # "this was about the code" for the same file). Simpler to add this
+    # one small column than to retrofit a discriminator onto
+    # PipelineReview's already-shipped structure.
+    schema_rejection_comment: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     # Null until this specific file has actually been generated -
     # distinct from the whole version's generated_code, which stays a
     # placeholder for a multi-file version until every file is approved.
@@ -334,10 +490,59 @@ class PipelineVersionFile(Base):
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
     )
     reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Same reasoning and same contract as PipelineVersion.generation_in_progress.
+    generation_in_progress: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     pipeline_version: Mapped["PipelineVersion"] = relationship(back_populates="files")
     runs: Mapped[list["PipelineRun"]] = relationship(back_populates="pipeline_version_file")
+
+
+class PipelineVersionScaffoldFile(Base):
+    """One supporting project file (docker-compose.yml, .env.example,
+    an Airflow DAG, etc.) proposed alongside a version's build plan -
+    created only for project_structure entries with generated=true;
+    "readme"/"license" entries are planning-only and never get a row
+    here at all (see ScaffoldFileType's own docstring).
+
+    Deliberately a separate table from PipelineVersionFile rather than
+    an extension of it: a scaffold file has no reads_from or
+    destination_table - nothing meaningful for a docker-compose.yml or
+    .gitignore to "read from" - and unlike pipeline files there's no
+    file-N-depends-on-file-N-minus-1 ordering requirement, so
+    file_order doesn't apply either. A shared table would mean a pile
+    of nullable, pipeline-only columns on every scaffold row.
+    """
+
+    __tablename__ = "pipeline_version_scaffold_files"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    pipeline_version_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("pipeline_versions.id"), nullable=False, index=True
+    )
+    path: Mapped[str] = mapped_column(String(255), nullable=False)
+    purpose: Mapped[str] = mapped_column(Text, nullable=False)
+    scaffold_type: Mapped[ScaffoldFileType] = mapped_column(
+        SAEnum(ScaffoldFileType, name="scaffold_file_type"), nullable=False
+    )
+    # Null until this file has actually been generated.
+    generated_content: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Distinct Postgres enum type name from both PipelineVersion's and
+    # PipelineVersionFile's review_status columns, same reasoning as
+    # PipelineVersionFile's own comment above - sharing one Postgres
+    # enum type across tables is a known Alembic autogenerate pitfall.
+    review_status: Mapped[PipelineVersionReviewStatus] = mapped_column(
+        SAEnum(PipelineVersionReviewStatus, name="pipeline_version_scaffold_file_review_status"),
+        default=PipelineVersionReviewStatus.draft,
+        nullable=False,
+    )
+    reviewed_by: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
+    )
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    pipeline_version: Mapped["PipelineVersion"] = relationship(back_populates="scaffold_files")
 
 
 class PipelineRun(Base):
@@ -393,6 +598,11 @@ class PipelineReview(Base):
     # per-file rejection feedback exist without a separate table.
     pipeline_version_file_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), ForeignKey("pipeline_version_files.id"), nullable=True, index=True
+    )
+    # Same reasoning as pipeline_version_file_id above, for a scaffold
+    # file's own approve/reject instead of a pipeline file's.
+    pipeline_version_scaffold_file_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("pipeline_version_scaffold_files.id"), nullable=True, index=True
     )
     actor_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=False

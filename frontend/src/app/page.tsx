@@ -58,10 +58,10 @@ export default function LandingPage() {
             <span className="text-sm font-bold tracking-tight">9Gear Pulse</span>
           </div>
           <div className="flex items-center gap-3 text-xs font-semibold">
-            <SignInButton forceRedirectUrl="/projects">
+            <SignInButton forceRedirectUrl="/home">
               <button className="rounded-lg px-3 py-2 text-slate-300 hover:text-white">Sign in</button>
             </SignInButton>
-            <SignUpButton forceRedirectUrl="/projects">
+            <SignUpButton forceRedirectUrl="/home">
               <button className="rounded-lg bg-cyan-600 px-3 py-2 text-white hover:bg-cyan-500">Sign up</button>
             </SignUpButton>
           </div>
@@ -84,7 +84,7 @@ export default function LandingPage() {
         </div>
 
         <div className="mt-10 flex items-center justify-center gap-3">
-          <SignUpButton forceRedirectUrl="/projects">
+          <SignUpButton forceRedirectUrl="/home">
             <button className="inline-flex items-center gap-1.5 rounded-lg bg-cyan-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-cyan-500">
               Get started <ArrowRight className="h-4 w-4" />
             </button>

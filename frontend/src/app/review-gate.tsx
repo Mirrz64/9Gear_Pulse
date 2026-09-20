@@ -2,7 +2,8 @@
 
 import { FormEvent, useEffect, useState } from 'react';
 import { useAuth } from '@clerk/nextjs';
-import { CheckCircle2, ClipboardCheck, Download, RefreshCw, Send, XCircle } from 'lucide-react';
+import { CheckCircle2, ChevronDown, ChevronRight, ClipboardCheck, Download, RefreshCw, Send, XCircle } from 'lucide-react';
+import MermaidDiagram from './mermaid-diagram';
 
 interface QualityChecks {
   checked: boolean;
@@ -37,6 +38,14 @@ interface ProposedFile {
   purpose: string;
   reads_from: string[];
   destination_table: string;
+  directory: string | null;
+}
+
+interface ScaffoldFile {
+  path: string;
+  purpose: string;
+  scaffold_type: string;
+  generated: boolean;
 }
 
 interface ArchitectureProposal {
@@ -50,6 +59,8 @@ interface ArchitectureProposal {
   key_transformations: string[];
   assumptions: string[];
   files: ProposedFile[];
+  architecture_diagram_mermaid: string | null;
+  project_structure: ScaffoldFile[];
 }
 
 interface VersionFile {
@@ -61,7 +72,28 @@ interface VersionFile {
   destination_table: string;
   generated_code: string | null;
   review_status: string;
+  generation_in_progress: boolean;
   runs: Run[];
+  // All four null/absent unless this version uses_pinned_schema - see
+  // ReviewPayload.version.uses_pinned_schema below, which gates
+  // whether the schema-review section renders for this file at all.
+  schema_ddl: string | null;
+  schema_review_status: string | null;
+  schema_applied_at: string | null;
+  schema_rejection_comment: string | null;
+}
+
+// Distinct from ScaffoldFile above (which is just a plan entry inside
+// an architecture proposal, not yet a real row) - this is an actual
+// PipelineVersionScaffoldFile once the proposal that named it has
+// been approved.
+interface VersionScaffoldFile {
+  id: string;
+  path: string;
+  purpose: string;
+  scaffold_type: string;
+  generated_content: string | null;
+  review_status: string;
 }
 
 interface ReviewPayload {
@@ -75,10 +107,14 @@ interface ReviewPayload {
     reviewed_at: string | null;
     architecture_proposal: ArchitectureProposal | null;
     architecture_status: string | null;
+    generation_in_progress: boolean;
+    uses_pinned_schema: boolean;
   };
   runs: Run[];
   review_history: ReviewRecord[];
   files: VersionFile[];
+  scaffold_files: VersionScaffoldFile[];
+  schedule: { id: string; cron_expression: string; next_run_at: string | null } | null;
 }
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
@@ -115,8 +151,22 @@ export default function ReviewGate({ context }: { context?: { pipelineId: string
   const [comment, setComment] = useState('');
   const [architectureComment, setArchitectureComment] = useState('');
   const [fileComment, setFileComment] = useState('');
+  const [schemaComment, setSchemaComment] = useState('');
+  const [scaffoldFileComment, setScaffoldFileComment] = useState('');
   const [editedCode, setEditedCode] = useState('');
   const [cronExpression, setCronExpression] = useState('0 2 * * *');
+  // Each run's log is collapsed by default and toggles independently -
+  // not an accordion where opening one closes another, matching how
+  // Airflow's own per-task log view behaves.
+  const [expandedRuns, setExpandedRuns] = useState<Set<string>>(new Set());
+  const toggleRun = (runId: string) => {
+    setExpandedRuns((prev) => {
+      const next = new Set(prev);
+      if (next.has(runId)) next.delete(runId);
+      else next.add(runId);
+      return next;
+    });
+  };
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -164,6 +214,12 @@ export default function ReviewGate({ context }: { context?: { pipelineId: string
       const result = payload as ReviewPayload;
       setReview(result);
       setEditedCode(result.version.code);
+      // Pre-fill with the REAL current schedule when one exists, so
+      // "Update schedule" edits the actual value instead of silently
+      // offering to overwrite it with the unrelated hardcoded default.
+      if (result.schedule) {
+        setCronExpression(result.schedule.cron_expression);
+      }
       window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ pipelineId: pipelineId.trim() }));
     } catch (error) {
       setReview(null);
@@ -171,6 +227,53 @@ export default function ReviewGate({ context }: { context?: { pipelineId: string
     } finally {
       setBusy(false);
     }
+  };
+
+  // Refetches the review WITHOUT toggling busy or resetting editedCode/
+  // cronExpression - a background poll tick shouldn't disable every
+  // button on the page for its duration, and it must never clobber
+  // something the user is actively typing into an editable field just
+  // because an unrelated background generation happened to tick at
+  // that moment. Read-only display data (review_status,
+  // generation_in_progress, runs) still updates live via setReview.
+  const fetchReviewSilently = async (): Promise<ReviewPayload | null> => {
+    try {
+      const token = await getToken();
+      if (!token) return null;
+      const response = await fetch(
+        `${API_BASE_URL}/api/v2/pipelines/${encodeURIComponent(pipelineId.trim())}/review`,
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
+      const payload: unknown = await response.json();
+      if (!response.ok) return null;
+      const result = payload as ReviewPayload;
+      setReview(result);
+      return result;
+    } catch {
+      return null;
+    }
+  };
+
+  // Generation now runs in a background Celery worker rather than
+  // inline in the request - there's no single HTTP response left to
+  // tell the UI "this attempt is over", so this polls until the given
+  // predicate (checked against a freshly-fetched review) says it's
+  // done. Capped at a fixed number of attempts rather than unbounded,
+  // so a genuinely stuck worker (crashed, never started) surfaces as a
+  // clear message instead of polling silently forever with no way for
+  // the user to know anything is wrong.
+  const pollUntilDone = async (isDone: (r: ReviewPayload) => boolean, label: string) => {
+    const maxAttempts = 60;
+    const intervalMs = 3000;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      const result = await fetchReviewSilently();
+      if (result && isDone(result)) {
+        setMessage(`${label} finished. Review the result below.`);
+        return;
+      }
+    }
+    setMessage(`${label} is taking longer than expected - it may still be running. Reload to check its latest status.`);
   };
 
   const submit = async (path: string, body: Record<string, string>) => {
@@ -230,6 +333,35 @@ export default function ReviewGate({ context }: { context?: { pipelineId: string
     }
   };
 
+  const unschedule = async () => {
+    if (!review) return;
+    if (!window.confirm('Stop this pipeline from running on its schedule? The pipeline and its review history stay intact.')) return;
+    setBusy(true);
+    setMessage(null);
+    try {
+      const token = await getToken();
+      if (!token) {
+        setMessage('You need to be signed in to do that.');
+        setBusy(false);
+        return;
+      }
+      const response = await fetch(`${API_BASE_URL}/api/v2/pipelines/${review.pipeline.id}/schedule`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!response.ok) {
+        const payload: unknown = await response.json();
+        throw new Error(getErrorMessage(payload));
+      }
+      setMessage('Schedule removed. The pipeline is no longer running automatically.');
+      await loadReview();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Unable to remove the schedule.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const exportPipeline = async () => {
     if (!review) return;
     setBusy(true);
@@ -272,7 +404,8 @@ export default function ReviewGate({ context }: { context?: { pipelineId: string
   const generateAndTest = async () => {
     if (!review) return;
     if (await submit(`/api/v2/pipelines/${review.pipeline.id}/generate`, { max_retries: '3' })) {
-      setMessage('Generation and sandbox test completed. Review the resulting version below.');
+      setMessage('Generation queued - this can take a while, especially across self-healing retries.');
+      void pollUntilDone((r) => !r.version.generation_in_progress, 'Generation');
     }
   };
 
@@ -301,7 +434,13 @@ export default function ReviewGate({ context }: { context?: { pipelineId: string
 
   const generateFile = async (fileId: string) => {
     if (await submit(`/api/v2/pipeline-version-files/${fileId}/generate`, { max_retries: '3' })) {
-      setMessage('File generated and sandbox-tested. Review the result below.');
+      setMessage('File generation queued - this can take a while, especially across self-healing retries.');
+      void pollUntilDone((r) => {
+        const file = r.files.find((f) => f.id === fileId);
+        // If the file is gone entirely (deleted mid-generation), stop
+        // polling rather than run to the attempt cap for nothing.
+        return file ? !file.generation_in_progress : true;
+      }, 'File generation');
     }
   };
 
@@ -319,8 +458,58 @@ export default function ReviewGate({ context }: { context?: { pipelineId: string
     }
   };
 
+  const proposeFileSchema = async (fileId: string) => {
+    // Synchronous, unlike generateFile - propose-schema is a pure AI
+    // call with no sandbox execution at all, so there's nothing to
+    // poll for; submit() already reloads the review after it resolves.
+    if (await submit(`/api/v2/pipeline-version-files/${fileId}/propose-schema`, {})) {
+      setMessage('Schema proposed - review the DDL below before it gets applied to the real database.');
+    }
+  };
+
+  const approveFileSchema = async (fileId: string) => {
+    if (await submit(`/api/v2/pipeline-version-files/${fileId}/approve-schema`, {})) {
+      setMessage('Schema approved and applied to the real database. You can now generate this file\'s code.');
+    }
+  };
+
+  const rejectFileSchema = async (fileId: string) => {
+    if (await submit(`/api/v2/pipeline-version-files/${fileId}/reject-schema`, { comment: schemaComment })) {
+      setSchemaComment('');
+      setMessage('Schema rejected - nothing was applied to the database. Propose a new one to try again.');
+    }
+  };
+
+  const generateScaffoldFile = async (scaffoldFileId: string) => {
+    // No max_retries - the backend endpoint takes no body at all;
+    // scaffold generation is one attempt plus type-appropriate
+    // validation, not a self-healing sandbox loop.
+    if (await submit(`/api/v2/pipeline-version-scaffold-files/${scaffoldFileId}/generate`, {})) {
+      setMessage('Scaffold file generated. Review the result below.');
+    }
+  };
+
+  const approveScaffoldFile = async (scaffoldFileId: string) => {
+    if (await submit(`/api/v2/pipeline-version-scaffold-files/${scaffoldFileId}/approve`, { comment: scaffoldFileComment })) {
+      setScaffoldFileComment('');
+      setMessage('Scaffold file approved.');
+    }
+  };
+
+  const rejectScaffoldFile = async (scaffoldFileId: string) => {
+    if (await submit(`/api/v2/pipeline-version-scaffold-files/${scaffoldFileId}/reject`, { comment: scaffoldFileComment })) {
+      setScaffoldFileComment('');
+      setMessage('Scaffold file rejected. Regenerate it to try again.');
+    }
+  };
+
   const canReview = review?.version.review_status === 'pending_review';
-  const canSchedule = review?.version.review_status === 'approved' && review?.pipeline.status !== 'scheduled';
+  // Being already scheduled is NOT a reason to disable this - the
+  // backend's schedule endpoint already updates cron_expression on an
+  // existing Schedule row and re-registers it (see register_schedule's
+  // replace_existing=True), rather than only ever creating a new one.
+  // The only genuine precondition is the version being approved.
+  const canSchedule = review?.version.review_status === 'approved';
   const alreadyScheduled = review?.pipeline.status === 'scheduled';
   const isMultiFile = (review?.files?.length ?? 0) > 0;
   const currentFileIndex = review?.files?.findIndex((f) => f.review_status !== 'approved') ?? -1;
@@ -415,6 +604,82 @@ export default function ReviewGate({ context }: { context?: { pipelineId: string
                   </div>
                 </div>
               )}
+
+              {review.version.architecture_proposal.architecture_diagram_mermaid && (
+                <div>
+                  <p className="text-[11px] font-semibold text-slate-400">Architecture diagram</p>
+                  <div className="mt-1.5">
+                    <MermaidDiagram chart={review.version.architecture_proposal.architecture_diagram_mermaid} />
+                  </div>
+                </div>
+              )}
+
+              {(review.version.architecture_proposal.files.length > 0 || review.version.architecture_proposal.project_structure.length > 0) && (
+                <div>
+                  <p className="text-[11px] font-semibold text-slate-400">Project structure</p>
+                  <div className="mt-1.5 rounded-lg border border-slate-800 bg-slate-950 p-3 font-mono text-[11px]">
+                    {(() => {
+                      const combined = [
+                        ...review.version.architecture_proposal.files.map((f) => ({
+                          path: f.directory ? `${f.directory}/${f.file_name}` : f.file_name,
+                          purpose: f.purpose,
+                          generated: true,
+                        })),
+                        ...review.version.architecture_proposal.project_structure.map((sf) => ({
+                          path: sf.path,
+                          purpose: sf.purpose,
+                          generated: sf.generated,
+                        })),
+                      ].sort((a, b) => {
+                        // Root-level files first, then each subfolder's
+                        // contents grouped together, alphabetically
+                        // within each group.
+                        const aIdx = a.path.lastIndexOf('/');
+                        const bIdx = b.path.lastIndexOf('/');
+                        const aDir = aIdx === -1 ? '' : a.path.slice(0, aIdx);
+                        const bDir = bIdx === -1 ? '' : b.path.slice(0, bIdx);
+                        return aDir === bDir ? a.path.localeCompare(b.path) : aDir.localeCompare(bDir);
+                      });
+
+                      // Indentation alone doesn't say WHAT a file is
+                      // indented under - without an explicit folder row,
+                      // indented entries read as nested under whatever
+                      // happened to sort immediately above them. Emit a
+                      // folder-name row every time the directory changes.
+                      const rows: JSX.Element[] = [];
+                      let lastDir: string | null = null;
+                      combined.forEach((item, i) => {
+                        const idx = item.path.lastIndexOf('/');
+                        const dir = idx === -1 ? '' : item.path.slice(0, idx);
+                        const name = idx === -1 ? item.path : item.path.slice(idx + 1);
+                        const dirDepth = dir ? dir.split('/').length : 0;
+
+                        if (dir && dir !== lastDir) {
+                          dir.split('/').forEach((segment, segIdx) => {
+                            rows.push(
+                              <div key={`dir-${i}-${segIdx}`} className="flex items-baseline gap-2 py-0.5" style={{ paddingLeft: `${segIdx * 16}px` }}>
+                                <span className="text-slate-600">{segIdx > 0 ? '└─' : '─'}</span>
+                                <span className="font-semibold text-cyan-400">{segment}/</span>
+                              </div>,
+                            );
+                          });
+                          lastDir = dir;
+                        }
+
+                        rows.push(
+                          <div key={i} className="flex flex-wrap items-baseline gap-x-2 py-0.5" style={{ paddingLeft: `${dirDepth * 16}px` }}>
+                            <span className="text-slate-600">{dirDepth > 0 ? '└─' : '─'}</span>
+                            <span className={item.generated ? 'text-slate-200' : 'text-slate-500 italic'}>{name}</span>
+                            <span className="text-[10px] text-slate-600">{item.purpose}</span>
+                          </div>,
+                        );
+                      });
+                      return rows;
+                    })()}
+                  </div>
+                  <p className="mt-1 text-[10px] text-slate-600">Grey, italicized entries are documentation only — 9Gear Pulse does not generate their content.</p>
+                </div>
+              )}
             </div>
           )}
 
@@ -452,15 +717,22 @@ export default function ReviewGate({ context }: { context?: { pipelineId: string
           </div>
         </div>
 
-        {((review.version.review_status === 'draft' && review.version.architecture_status === 'approved') || review.version.review_status === 'testing') && <button onClick={generateAndTest} disabled={busy} className="inline-flex items-center gap-1.5 rounded-lg bg-cyan-600 px-3 py-2 text-xs font-semibold text-white hover:bg-cyan-500 disabled:opacity-50"><Send className="h-3.5 w-3.5" /> {review.version.review_status === 'testing' ? 'Retry generate & sandbox test' : 'Generate & sandbox test'}</button>}
+        {((review.version.review_status === 'draft' && review.version.architecture_status === 'approved') || review.version.review_status === 'testing') && <button onClick={generateAndTest} disabled={busy || review.version.generation_in_progress} className="inline-flex items-center gap-1.5 rounded-lg bg-cyan-600 px-3 py-2 text-xs font-semibold text-white hover:bg-cyan-500 disabled:opacity-50"><Send className="h-3.5 w-3.5" /> {review.version.generation_in_progress ? 'Generating...' : review.version.review_status === 'testing' ? 'Retry generate & sandbox test' : 'Generate & sandbox test'}</button>}
 
 
         <div className="rounded-lg border border-slate-800 bg-slate-950 p-4">
           <p className="mb-3 text-xs font-semibold uppercase tracking-wide text-slate-400">Sandbox evidence</p>
           {review.runs.length === 0 ? <p className="text-xs text-amber-400">No sandbox run is recorded for this version.</p> : review.runs.map((run) => (
             <div key={run.id} className="border-t border-slate-800 py-3 first:border-t-0 first:pt-0">
-              <p className="text-xs font-semibold text-slate-200">{run.status} {run.row_count !== null ? `· ${run.row_count} rows` : ''}</p>
-              <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap font-mono text-xs text-slate-400">{run.log_output || run.error_output || 'No output recorded.'}</pre>
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-xs font-semibold text-slate-200">{run.status} {run.row_count !== null ? `· ${run.row_count} rows` : ''}</p>
+                <button onClick={() => toggleRun(run.id)} className="inline-flex items-center gap-1 text-[11px] font-semibold text-slate-400 hover:text-slate-200">
+                  {expandedRuns.has(run.id) ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />} {expandedRuns.has(run.id) ? 'Hide log' : 'View log'}
+                </button>
+              </div>
+              {expandedRuns.has(run.id) && (
+                <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap font-mono text-xs text-slate-400">{run.log_output || run.error_output || 'No output recorded.'}</pre>
+              )}
               {run.quality_checks?.checked && run.quality_checks.warnings && run.quality_checks.warnings.length > 0 && (
                 <div className="mt-2 rounded-lg border border-amber-800 bg-amber-950/40 p-2.5">
                   <p className="text-[11px] font-semibold text-amber-400 mb-1">⚠ Data quality warnings — {run.quality_checks.dataset}.{run.quality_checks.table}</p>
@@ -504,22 +776,85 @@ export default function ReviewGate({ context }: { context?: { pipelineId: string
 
                   {isLocked && <p className="mt-2 text-[11px] italic text-slate-600">Waiting for earlier files to be approved.</p>}
 
+                  {isCurrent && review.version.uses_pinned_schema && (
+                    <div className="mt-3 rounded-lg border border-indigo-900 bg-indigo-950/20 p-3">
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-indigo-300">
+                        Destination schema {file.schema_review_status ? `— ${file.schema_review_status.replace('_', ' ')}` : '— not proposed yet'}
+                      </p>
+
+                      {!file.schema_review_status || file.schema_review_status === 'rejected' ? (
+                        <>
+                          {file.schema_review_status === 'rejected' && file.schema_rejection_comment && (
+                            <p className="mt-2 text-[11px] text-rose-300">Previous feedback: {file.schema_rejection_comment}</p>
+                          )}
+                          <button onClick={() => proposeFileSchema(file.id)} disabled={busy}
+                            className="mt-2 inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-2 text-xs font-semibold text-white hover:bg-indigo-500 disabled:opacity-50">
+                            <ClipboardCheck className="h-3.5 w-3.5" /> {file.schema_review_status === 'rejected' ? 'Propose schema again' : 'Propose schema'}
+                          </button>
+                        </>
+                      ) : (
+                        <>
+                          {file.schema_ddl && (
+                            <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap rounded-lg border border-slate-800 bg-slate-900 p-3 font-mono text-[11px] text-indigo-200">{file.schema_ddl}</pre>
+                          )}
+                          {file.schema_review_status === 'approved' ? (
+                            <p className="mt-2 text-[11px] text-emerald-400">
+                              Applied to the real database{file.schema_applied_at ? ` at ${new Date(file.schema_applied_at).toLocaleString()}` : ''}. This table's structure is now fixed.
+                            </p>
+                          ) : (
+                            <>
+                              <p className="mt-2 text-[11px] text-slate-400">Review the DDL above - approving it runs CREATE TABLE against the real database right now, before any code exists for this file.</p>
+                              <div className="mt-2 flex flex-wrap items-center gap-2">
+                                <button onClick={() => approveFileSchema(file.id)} disabled={busy}
+                                  className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-50">
+                                  <CheckCircle2 className="h-3.5 w-3.5" /> Approve & apply schema
+                                </button>
+                                <input value={schemaComment} onChange={(e) => setSchemaComment(e.target.value)} placeholder="Rejection reason (optional)"
+                                  className="min-w-[12rem] flex-1 rounded-lg border border-slate-700 bg-slate-900 px-2 py-1.5 text-xs text-slate-100 placeholder:text-slate-500 focus:border-indigo-500 focus:outline-none" />
+                                <button onClick={() => rejectFileSchema(file.id)} disabled={busy}
+                                  className="inline-flex items-center gap-1.5 rounded-lg border border-rose-800 px-3 py-2 text-xs font-semibold text-rose-300 hover:bg-rose-950 disabled:opacity-50">
+                                  <XCircle className="h-3.5 w-3.5" /> Reject
+                                </button>
+                              </div>
+                            </>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  )}
+
                   {file.generated_code && (
                     <pre className="mt-3 max-h-56 overflow-auto whitespace-pre-wrap rounded-lg border border-slate-800 bg-slate-900 p-3 font-mono text-[11px] text-emerald-300">{file.generated_code}</pre>
                   )}
 
                   {isCurrent && (file.review_status === 'draft' || file.review_status === 'testing' || file.review_status === 'rejected') && (
-                    <button onClick={() => generateFile(file.id)} disabled={busy} className="mt-3 inline-flex items-center gap-1.5 rounded-lg bg-cyan-600 px-3 py-2 text-xs font-semibold text-white hover:bg-cyan-500 disabled:opacity-50">
-                      <Send className="h-3.5 w-3.5" /> {file.review_status === 'testing' || file.review_status === 'rejected' ? 'Retry generate & sandbox test' : 'Generate & sandbox test'}
-                    </button>
+                    // Same precondition the backend itself enforces: when this
+                    // version uses pinned schemas, code generation is disabled
+                    // until this file's own schema is approved - matching
+                    // generate_and_test_file's own gate exactly, so the button
+                    // never leads to a confusing 409 the user has to decode.
+                    (!review.version.uses_pinned_schema || file.schema_review_status === 'approved') ? (
+                      <button onClick={() => generateFile(file.id)} disabled={busy || file.generation_in_progress} className="mt-3 inline-flex items-center gap-1.5 rounded-lg bg-cyan-600 px-3 py-2 text-xs font-semibold text-white hover:bg-cyan-500 disabled:opacity-50">
+                        <Send className="h-3.5 w-3.5" /> {file.generation_in_progress ? 'Generating...' : file.review_status === 'testing' || file.review_status === 'rejected' ? 'Retry generate & sandbox test' : 'Generate & sandbox test'}
+                      </button>
+                    ) : (
+                      <p className="mt-3 text-[11px] italic text-slate-600">Approve this file's schema above before generating its code.</p>
+                    )
                   )}
 
                   {isCurrent && file.runs.length > 0 && (
                     <div className="mt-3 border-t border-slate-800 pt-3">
                       {file.runs.map((run) => (
                         <div key={run.id} className="mb-2">
-                          <p className="text-[11px] font-semibold text-slate-300">{run.status} {run.row_count !== null ? `· ${run.row_count} rows` : ''}</p>
-                          <pre className="mt-1 max-h-28 overflow-auto whitespace-pre-wrap font-mono text-[11px] text-slate-400">{run.log_output || run.error_output || 'No output recorded.'}</pre>
+                          <div className="flex items-center justify-between gap-2">
+                            <p className="text-[11px] font-semibold text-slate-300">{run.status} {run.row_count !== null ? `· ${run.row_count} rows` : ''}</p>
+                            <button onClick={() => toggleRun(run.id)} className="inline-flex items-center gap-1 text-[10px] font-semibold text-slate-500 hover:text-slate-300">
+                              {expandedRuns.has(run.id) ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />} {expandedRuns.has(run.id) ? 'Hide log' : 'View log'}
+                            </button>
+                          </div>
+                          {expandedRuns.has(run.id) && (
+                            <pre className="mt-1 max-h-28 overflow-auto whitespace-pre-wrap font-mono text-[11px] text-slate-400">{run.log_output || run.error_output || 'No output recorded.'}</pre>
+                          )}
                           {run.quality_checks?.checked && run.quality_checks.warnings && run.quality_checks.warnings.length > 0 && (
                             <div className="mt-1.5 rounded-lg border border-amber-800 bg-amber-950/40 p-2">
                               <p className="text-[10px] font-semibold text-amber-400">⚠ Data quality warnings</p>
@@ -554,6 +889,44 @@ export default function ReviewGate({ context }: { context?: { pipelineId: string
           </div>
         )}
 
+        {review.scaffold_files.length > 0 && (
+          <div className="space-y-3">
+            <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">Scaffold files ({review.scaffold_files.length})</p>
+            {review.scaffold_files.map((sf) => (
+              <div key={sf.id} className={`rounded-lg border p-4 ${sf.review_status === 'approved' ? 'border-emerald-800 bg-emerald-950/20' : 'border-slate-800 bg-slate-950'}`}>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono text-xs font-semibold text-slate-100">{sf.path}</span>
+                    <span className="rounded-full border border-slate-700 bg-slate-900 px-2 py-0.5 font-mono text-[10px] text-slate-400">{sf.scaffold_type}</span>
+                  </div>
+                  <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase ${sf.review_status === 'approved' ? 'bg-emerald-900 text-emerald-300' : 'bg-slate-800 text-slate-400'}`}>{sf.review_status.replace('_', ' ')}</span>
+                </div>
+                <p className="mt-1.5 text-[11px] text-slate-400">{sf.purpose}</p>
+
+                {sf.generated_content && (
+                  <pre className="mt-3 max-h-56 overflow-auto whitespace-pre-wrap rounded-lg border border-slate-800 bg-slate-900 p-3 font-mono text-[11px] text-emerald-300">{sf.generated_content}</pre>
+                )}
+
+                {(sf.review_status === 'draft' || sf.review_status === 'testing' || sf.review_status === 'rejected') && (
+                  <button onClick={() => generateScaffoldFile(sf.id)} disabled={busy} className="mt-3 inline-flex items-center gap-1.5 rounded-lg bg-cyan-600 px-3 py-2 text-xs font-semibold text-white hover:bg-cyan-500 disabled:opacity-50">
+                    <Send className="h-3.5 w-3.5" /> {sf.review_status === 'testing' || sf.review_status === 'rejected' ? 'Retry generate' : 'Generate'}
+                  </button>
+                )}
+
+                {sf.review_status === 'pending_review' && (
+                  <div className="mt-3 space-y-2">
+                    <textarea value={scaffoldFileComment} onChange={(e) => setScaffoldFileComment(e.target.value)} placeholder="Why is this file safe to approve, or why is it rejected?" className="h-16 w-full rounded-lg border border-slate-700 bg-slate-900 p-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-violet-500 focus:outline-none" />
+                    <div className="flex gap-2">
+                      <button onClick={() => approveScaffoldFile(sf.id)} disabled={busy} className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-50"><CheckCircle2 className="h-3.5 w-3.5" /> Approve file</button>
+                      <button onClick={() => rejectScaffoldFile(sf.id)} disabled={busy} className="inline-flex items-center gap-1.5 rounded-lg border border-rose-800 bg-rose-950 px-3 py-2 text-xs font-semibold text-rose-300 hover:bg-rose-900 disabled:opacity-50"><XCircle className="h-3.5 w-3.5" /> Reject file</button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
         <div className="grid gap-4 lg:grid-cols-2">
           <div className="space-y-2">
             <label className="block text-xs font-semibold text-slate-300">Review comment</label>
@@ -578,7 +951,12 @@ export default function ReviewGate({ context }: { context?: { pipelineId: string
 
         <div className="flex flex-col gap-2 rounded-lg border border-slate-800 bg-slate-950 p-4 sm:flex-row sm:items-end">
           <label className="flex-1 text-xs font-semibold text-slate-300">Approved schedule (five-field cron)<input value={cronExpression} onChange={(event) => setCronExpression(event.target.value)} className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 font-mono text-xs text-slate-100 focus:border-violet-500 focus:outline-none" /></label>
-          <button onClick={schedule} disabled={!canSchedule || busy} className="rounded-lg bg-violet-600 px-3 py-2 text-xs font-semibold text-white hover:bg-violet-500 disabled:cursor-not-allowed disabled:bg-slate-700">{alreadyScheduled ? 'Already scheduled' : 'Schedule approved version'}</button>
+          <button onClick={schedule} disabled={!canSchedule || busy} className="rounded-lg bg-violet-600 px-3 py-2 text-xs font-semibold text-white hover:bg-violet-500 disabled:cursor-not-allowed disabled:bg-slate-700">{alreadyScheduled ? 'Update schedule' : 'Schedule approved version'}</button>
+          {alreadyScheduled && (
+            <button onClick={unschedule} disabled={busy} className="inline-flex items-center gap-1.5 rounded-lg border border-rose-800 px-3 py-2 text-xs font-semibold text-rose-300 hover:bg-rose-950 disabled:opacity-50">
+              <XCircle className="h-3.5 w-3.5" /> Stop schedule
+            </button>
+          )}
         </div>
       </div>}
     </section>

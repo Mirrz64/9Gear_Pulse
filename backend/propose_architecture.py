@@ -34,6 +34,7 @@ from typing import List, Optional
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 import anthropic
+from ai_provider import call_with_rate_limit_backoff
 import openai
 
 load_dotenv(override=False)
@@ -53,6 +54,36 @@ class ProposedFile(BaseModel):
     # never a table not present in the schema or in an earlier file.
     reads_from: List[str] = Field(default_factory=list)
     destination_table: str
+    # Where this file conceptually sits in the exported project tree -
+    # null/empty for the project root, otherwise a folder name (e.g.
+    # "src"). Purely a planning/display hint for project_structure's
+    # tree - file_name itself stays a bare filename throughout, since
+    # generation, the sandbox, and PipelineVersionFile.file_name all
+    # depend on that never changing.
+    directory: Optional[str] = None
+
+
+class ScaffoldFile(BaseModel):
+    """A supporting project file beyond the pipeline .py files already
+    covered by ArchitectureProposal.files - infra/config a project
+    needs to be genuinely runnable standalone (outside 9Gear Pulse's
+    own sandbox, which every pipeline file already assumes exists),
+    or documentation proposed for planning visibility only.
+    """
+    path: str
+    purpose: str
+    # A closed-ish vocabulary the generation step downstream can
+    # dispatch on directly, rather than re-parsing free-text purpose
+    # to guess what kind of file this is: "readme", "license",
+    # "docker_compose", "env_example", "gitignore", "requirements",
+    # "airflow_dag", "other".
+    scaffold_type: str
+    # False only for readme/license - their real content is prose/
+    # legal text this system has no genuine basis to author, so
+    # they're proposed for planning visibility only and never
+    # actually generated. Everything else with generated=true is a
+    # real file a later step will produce.
+    generated: bool
 
 
 class ArchitectureProposal(BaseModel):
@@ -75,6 +106,13 @@ class ArchitectureProposal(BaseModel):
     # tested, and reviewed. Empty when feasible is false - there's
     # nothing to plan around a goal that doesn't match the schema.
     files: List[ProposedFile] = Field(default_factory=list)
+    # A Mermaid flowchart describing the same data flow as `files`
+    # above, visually - empty when feasible is false, same as files.
+    architecture_diagram_mermaid: Optional[str] = None
+    # Supporting project structure beyond the pipeline files already
+    # in `files` - see ScaffoldFile's own docstring for what belongs
+    # here and what doesn't.
+    project_structure: List[ScaffoldFile] = Field(default_factory=list)
 
 
 SYSTEM_PROMPT = """You are a data pipeline architect. Given a database schema \
@@ -100,15 +138,39 @@ goal is mostly achievable but one piece isn't) should still be \
 feasible=false, with feasibility_notes explaining exactly which part can't \
 be fulfilled and why - do not round a partial match up to a full yes.
 
+A schema_summary entry with "schema": "redis" describes a Redis KEY \
+PATTERN, not a relational table - its "table" value (e.g. "user:*") is a \
+SCAN-matchable pattern covering many real keys, not one literal key. Treat \
+it exactly like any other real table name for source_tables_used and \
+reads_from purposes - the same "only real names already in schema_summary, \
+never one you're introducing" rule applies identically. Two extra fields \
+appear only on these entries and exist specifically to inform the build \
+plan: redis_type (the actual Redis data structure - string, hash, list, \
+set, zset, or stream - which determines what reading a matching key \
+actually looks like) and example_key (one real key that matched the \
+pattern during introspection, showing the real naming convention in use). \
+A file whose reads_from includes a Redis pattern must mention in its \
+purpose which redis_type it's reading, since that directly determines how \
+the file's code will need to read each key.
+
 If feasible, describe the intended approach in plain language: which real \
 tables you'll read (source_tables_used - actual names from schema_summary, \
 never names you're introducing), what transformation logic will happen \
 (key_transformations), and where the final result will be written \
-(destination_dataset and destination_table).
+(destination_dataset and destination_table - destination_table here \
+follows the same "schema.table" rule detailed below for each file's own \
+destination_table, never a bare table name alone).
 
 Then break the work into files, listed in the exact order they must be \
-built. Each file writes to its own real, named destination_table - this \
-plan will be built and tested one file at a time, each file's destination \
+built. Each file writes to its own real, named destination_table, ALWAYS \
+written as "schema.table" with an explicit schema prefix - never a bare \
+table name alone, even when only one schema is realistically in play. \
+This is a hard rule, not just what the example below happens to show: a \
+bare table name here leaves the actual destination schema ambiguous to \
+whatever generates and re-generates this file's code later, and \
+different attempts can and do pick different schemas for the exact same \
+bare name when nothing pins it down. This plan will be built and tested \
+one file at a time, each file's destination \
 table verified to genuinely exist before the next file is allowed to \
 depend on it. Because of that, a file's reads_from list may only contain: \
 real table names from schema_summary, or the destination_table of an \
@@ -123,6 +185,73 @@ distinct cleansing/masking step whose output several later steps will \
 each depend on, or a bronze/silver/gold pattern the goal actually calls \
 for). When in doubt, prefer fewer files.
 
+Two more things to produce alongside the file-by-file build plan, only \
+when feasible is true:
+
+Architecture Diagram — architecture_diagram_mermaid must be a complete, \
+syntactically valid Mermaid flowchart (`flowchart LR` or `graph LR`) \
+showing the real data flow: the actual source table(s), through each \
+file in the build plan in order, to the final destination. Label edges \
+with what actually happens ("reads", "writes", "parses") rather than \
+leaving them bare. Use the exact same names already used elsewhere in \
+this response (source_tables_used, each file's file_name and \
+destination_table) so the diagram matches the prose exactly instead of \
+introducing new names for the same things. Example shape:
+
+    flowchart LR
+        A[bronze.bronze_events] -->|reads| B[01_parse_events.py]
+        B -->|writes| C[silver.stg_events]
+        C -->|reads| D[02_silver_customers.py]
+        D -->|writes| E[silver.silver_customers]
+
+Project Structure — project_structure lists the supporting files this \
+project has beyond the pipeline files already in `files`. Four entries \
+are ALWAYS present: README.md ("Project overview and usage \
+instructions", scaffold_type "readme", generated=false, since its real \
+content is prose this system has no genuine basis to author), LICENSE \
+("Project license", scaffold_type "license", generated=false, same \
+reasoning), requirements.txt ("Python dependencies", scaffold_type \
+"requirements", generated=true), and .gitignore ("Files and folders \
+git should not track", scaffold_type "gitignore", generated=true) - \
+unlike docker-compose.yml or an Airflow DAG, every exported pipeline \
+needs its dependencies listed and a sane .gitignore to actually be \
+runnable standalone, regardless of what that specific project's own \
+infrastructure needs, so these two are never conditional. Beyond those \
+four, only propose an additional infra/config file when THIS project's \
+own execution genuinely needs something not already provided — \
+9Gear Pulse's own sandbox and destination database are already \
+provisioned for every pipeline, so do not propose docker-compose.yml \
+or .env merely because a standalone data engineering project typically \
+has one; only propose them if this pipeline needs something genuinely \
+beyond that. The same restraint applies to an Airflow DAG — only \
+propose one when the build plan's own scheduling/dependency needs are \
+complex enough to actually warrant it (e.g. multiple independent \
+schedules or non-trivial cross-pipeline dependencies); a simple daily \
+or hourly run, which 9Gear Pulse's own scheduler already handles, is \
+not a reason to add one. When in doubt about anything beyond the four \
+always-present files, propose nothing more — the same "prefer fewer" \
+restraint that governs the file-by-file build plan above applies here \
+too. Valid scaffold_type values beyond "readme"/"license": \
+"docker_compose", "env_example", "gitignore", "requirements", \
+"airflow_dag", "other".
+
+Where things live in the tree — project_structure's `path` may include \
+a folder prefix (e.g. "dags/pipeline_dag.py") when a file genuinely \
+belongs in its own subfolder rather than the project root. An Airflow \
+DAG in particular must never sit directly in the root next to README - \
+give it its own folder (e.g. "dags/"). README.md, LICENSE, \
+requirements.txt, and .gitignore are conventionally root-level (a bare \
+filename, no folder prefix) unless there's a real reason otherwise. \
+Separately, each entry in `files` (the pipeline build plan) has its \
+own `directory` field for the SAME purpose - null/empty for the \
+project root, or a folder name (e.g. "src") if this project's files \
+belong together in one. A small build plan (a file or two) sitting \
+directly in the root is completely normal - don't invent a subfolder \
+for its own sake; use one when it genuinely groups related files \
+together or matches what the rest of project_structure already implies \
+(e.g. pipeline files alongside a "dags/" folder for their own \
+orchestration).
+
 Do not write any code. This is a plan for a human to review before code \
 generation begins."""
 
@@ -133,14 +262,14 @@ def propose_architecture(schema_summary: dict, goal: str) -> dict:
     if anthropic_client:
         try:
             print("[Architect] Contacting Primary AI Provider: Anthropic (Claude Sonnet 5)...")
-            response = anthropic_client.messages.parse(
+            response = call_with_rate_limit_backoff(lambda: anthropic_client.messages.parse(
                 model="claude-sonnet-5",
                 max_tokens=16000,
                 thinking={"type": "disabled"},
                 system=SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": user_content}],
                 output_format=ArchitectureProposal,
-            )
+            ))
             if response.parsed_output is None:
                 raise RuntimeError(
                     f"Claude did not return a complete structured response "
@@ -197,3 +326,13 @@ if __name__ == "__main__":
             print(f"  {f['file_name']}: reads [{reads}] -> writes {f['destination_table']}")
     elif result.get("destination_table"):
         print(f"Destination: {result.get('destination_dataset')}.{result.get('destination_table')}")
+
+    if result.get("architecture_diagram_mermaid"):
+        print("\nArchitecture diagram (Mermaid):")
+        print(result["architecture_diagram_mermaid"])
+
+    if result.get("project_structure"):
+        print("\nProject structure:")
+        for sf in result["project_structure"]:
+            marker = "[generated]" if sf["generated"] else "[planning only]"
+            print(f"  {sf['path']} {marker} - {sf['purpose']}")
