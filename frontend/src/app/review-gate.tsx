@@ -167,6 +167,18 @@ export default function ReviewGate({ context }: { context?: { pipelineId: string
       return next;
     });
   };
+  // Matches the same emerald/rose/amber convention already used
+  // throughout this app for success/danger/warning, rather than
+  // introducing a new color language just for this one widget.
+  const runStatusColor = (status: string) => {
+    if (status === 'success') return 'bg-emerald-500';
+    if (status === 'failed') return 'bg-rose-500';
+    if (status === 'retrying') return 'bg-amber-500';
+    return 'bg-slate-600';
+  };
+  const expandRun = (runId: string) => {
+    setExpandedRuns((prev) => new Set(prev).add(runId));
+  };
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -518,7 +530,7 @@ export default function ReviewGate({ context }: { context?: { pipelineId: string
     <section className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-xl space-y-5">
       <div className="flex items-start justify-between gap-4">
         <div>
-          <h2 className="text-lg font-semibold flex items-center gap-2"><ClipboardCheck className="h-5 w-5 text-violet-400" /> Review &amp; approval gate</h2>
+          <h1 className="text-2xl font-bold tracking-tight text-slate-100 flex items-center gap-2"><ClipboardCheck className="h-6 w-6 text-violet-400" /> Review &amp; approval gate</h1>
           <p className="mt-1 text-xs text-slate-400">Only a successfully sandbox-tested version can be approved or scheduled.</p>
         </div>
         {review && <span className="rounded-full border border-violet-800 bg-violet-950 px-2.5 py-1 text-xs font-semibold text-violet-300">v{review.version.number} · {review.version.review_status.replace('_', ' ')}</span>}
@@ -722,6 +734,22 @@ export default function ReviewGate({ context }: { context?: { pipelineId: string
 
         <div className="rounded-lg border border-slate-800 bg-slate-950 p-4">
           <p className="mb-3 text-xs font-semibold uppercase tracking-wide text-slate-400">Sandbox evidence</p>
+          {review.runs.length > 0 && (
+            <div className="mb-4 flex items-end gap-1">
+              {/* Runs arrive newest-first from the API; reversed here so
+                  the strip reads left (oldest) to right (most recent),
+                  matching how a person naturally reads a timeline. */}
+              {[...review.runs].reverse().map((run) => (
+                <button
+                  key={run.id}
+                  onClick={() => expandRun(run.id)}
+                  title={`${run.status}${run.row_count !== null ? ` · ${run.row_count} rows` : ''} · ${new Date(run.started_at).toLocaleString()}${run.status === 'failed' && run.error_output ? ` · ${run.error_output.slice(0, 120)}` : ''}`}
+                  className={`h-6 w-3 shrink-0 rounded-sm ${runStatusColor(run.status)} hover:opacity-75`}
+                  aria-label={`View log for ${run.status} run started ${new Date(run.started_at).toLocaleString()}`}
+                />
+              ))}
+            </div>
+          )}
           {review.runs.length === 0 ? <p className="text-xs text-amber-400">No sandbox run is recorded for this version.</p> : review.runs.map((run) => (
             <div key={run.id} className="border-t border-slate-800 py-3 first:border-t-0 first:pt-0">
               <div className="flex items-center justify-between gap-2">
