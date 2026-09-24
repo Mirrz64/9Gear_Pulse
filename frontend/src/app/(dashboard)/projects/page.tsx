@@ -3,7 +3,7 @@
 import { FormEvent, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useAuth } from '@clerk/nextjs';
-import { ArrowRight, FolderPlus, Pencil, Trash2, X } from 'lucide-react';
+import { ArrowRight, ChevronDown, ChevronRight, FolderPlus, Pencil, Trash2, X } from 'lucide-react';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
 
@@ -44,6 +44,14 @@ export default function ProjectsPage() {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [name, setName] = useState('');
   const [goal, setGoal] = useState('');
+  // Genuinely optional, kept collapsed by default so the fast path
+  // (name + goal) stays the default experience, not something users
+  // have to scroll past every time.
+  const [showMoreDetails, setShowMoreDetails] = useState(false);
+  const [objectives, setObjectives] = useState('');
+  const [datasetNotes, setDatasetNotes] = useState('');
+  const [knownConstraints, setKnownConstraints] = useState('');
+  const [loadPattern, setLoadPattern] = useState('');
 
   // Editing an existing project - only one at a time, tracked by id.
   // Unlike connection profiles, a project's fields (name, goal
@@ -95,13 +103,24 @@ export default function ProjectsPage() {
       const res = await fetch(`${API_BASE_URL}/api/v2/projects`, {
         method: 'POST',
         headers: { ...headers, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, goal_description: goal }),
+        body: JSON.stringify({
+          name, goal_description: goal,
+          ...(objectives.trim() ? { objectives: objectives.trim() } : {}),
+          ...(datasetNotes.trim() ? { dataset_notes: datasetNotes.trim() } : {}),
+          ...(knownConstraints.trim() ? { known_constraints: knownConstraints.trim() } : {}),
+          ...(loadPattern ? { load_pattern: loadPattern } : {}),
+        }),
       });
       const data: unknown = await res.json();
       if (!res.ok) throw new Error(getErrorMessage(data));
       notify('success', `Project "${name}" created.`);
       setName('');
       setGoal('');
+      setObjectives('');
+      setDatasetNotes('');
+      setKnownConstraints('');
+      setLoadPattern('');
+      setShowMoreDetails(false);
       await loadProjects();
     } catch (err) {
       notify('error', err instanceof Error ? err.message : 'Failed to create project.');
@@ -167,17 +186,47 @@ export default function ProjectsPage() {
 
   return (
     <div className="space-y-6">
+      <h1 className="text-2xl font-bold tracking-tight text-slate-100">Projects</h1>
+
       <section className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-xl space-y-4">
         <h2 className="text-lg font-semibold flex items-center gap-2"><FolderPlus className="h-5 w-5 text-cyan-400" /> New project</h2>
-        <form onSubmit={createProject} className="grid gap-3 md:grid-cols-[1fr_2fr_auto] rounded-lg border border-slate-800 bg-slate-950 p-4">
-          <input required value={name} onChange={(e) => setName(e.target.value)} placeholder="Project name"
-            className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
-          <input required value={goal} onChange={(e) => setGoal(e.target.value)} placeholder="Pipeline goal (plain English)"
-            className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
-          <button type="submit" disabled={creating}
-            className="rounded-lg bg-cyan-600 px-4 py-2 text-xs font-semibold text-white hover:bg-cyan-500 disabled:opacity-50">
-            Create project
+        <form onSubmit={createProject} className="space-y-3 rounded-lg border border-slate-800 bg-slate-950 p-4">
+          <div className="grid gap-3 md:grid-cols-[1fr_2fr_auto]">
+            <input required value={name} onChange={(e) => setName(e.target.value)} placeholder="Project name"
+              className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+            <input required value={goal} onChange={(e) => setGoal(e.target.value)} placeholder="Pipeline goal (plain English)"
+              className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+            <button type="submit" disabled={creating}
+              className="rounded-lg bg-cyan-600 px-4 py-2 text-xs font-semibold text-white hover:bg-cyan-500 disabled:opacity-50">
+              Create project
+            </button>
+          </div>
+
+          <button type="button" onClick={() => setShowMoreDetails((v) => !v)}
+            className="inline-flex items-center gap-1 text-[11px] font-semibold text-slate-400 hover:text-slate-200">
+            {showMoreDetails ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />} Add more details (optional)
           </button>
+
+          {showMoreDetails && (
+            <div className="grid gap-3 rounded-lg border border-slate-800 bg-slate-900 p-3 md:grid-cols-2">
+              <textarea value={objectives} onChange={(e) => setObjectives(e.target.value)} placeholder="Objectives - what does success look like beyond the bare goal?"
+                className="h-20 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+              <textarea value={datasetNotes} onChange={(e) => setDatasetNotes(e.target.value)} placeholder="Dataset notes - what do specific values actually mean? (e.g. status 1=pending, 2=shipped)"
+                className="h-20 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+              <textarea value={knownConstraints} onChange={(e) => setKnownConstraints(e.target.value)} placeholder="Known constraints - rate limits, expected duplicates, known data issues"
+                className="h-20 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+              <label className="flex flex-col gap-1">
+                <span className="text-[11px] text-slate-400">Load pattern</span>
+                <select value={loadPattern} onChange={(e) => setLoadPattern(e.target.value)}
+                  className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-100 focus:border-cyan-500 focus:outline-none">
+                  <option value="">Not specified</option>
+                  <option value="full_refresh">Full refresh - replace the destination entirely each run</option>
+                  <option value="append_only">Append only - only ever add new records</option>
+                  <option value="incremental">Incremental - update changed records, add new ones</option>
+                </select>
+              </label>
+            </div>
+          )}
         </form>
         {message && (
           <p className={`rounded-lg border px-3 py-2 text-xs ${
