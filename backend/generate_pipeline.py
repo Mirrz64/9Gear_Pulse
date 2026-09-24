@@ -518,6 +518,35 @@ the destination is Redis, not a SQL database - skip every other rule in \
 this section entirely (none of them apply) and follow the separate Redis \
 Destination section below instead. If DEST_REDIS_URL is absent, proceed \
 with the SQL destination rules below exactly as always.
+- Check next whether DEST_SNOWFLAKE_ACCOUNT is set. If it is, the \
+destination is Snowflake - skip every other rule in this section entirely \
+(none of them apply, including the generic SQLAlchemy rule below - \
+Snowflake's real, preferred load mechanism is staged-file bulk loading, \
+which the generic SQLAlchemy destination does not do) and follow the \
+separate Snowflake Destination section below instead. If \
+DEST_SNOWFLAKE_ACCOUNT is absent, proceed with the SQL destination rules \
+below exactly as always.
+- Check next whether DEST_S3_BUCKET_URL is set. If it is, the destination \
+is S3 (or an S3-compatible service like MinIO) - skip every other rule in \
+this section entirely, including the generic SQLAlchemy rule below - there \
+is no SQL concept of any kind for object storage, no CREATE TABLE, nothing \
+SQLAlchemy-compatible - and follow the separate S3 Destination section \
+below instead. If DEST_S3_BUCKET_URL is absent, proceed with the SQL \
+destination rules below exactly as always.
+- Check next whether DEST_AZURE_BLOB_BUCKET_URL is set. If it is, the \
+destination is Azure Blob Storage - the exact same reasoning as S3 above \
+applies (no SQL concept of any kind, skip every other rule in this section \
+entirely) and follow the separate Azure Blob Storage Destination section \
+below instead. If DEST_AZURE_BLOB_BUCKET_URL is absent, proceed with the \
+SQL destination rules below exactly as always.
+- Check next whether DEST_BIGQUERY_PROJECT_ID is set. If it is, the \
+destination is BigQuery - skip every other rule in this section entirely \
+(none of them apply, including the generic SQLAlchemy rule below - \
+BigQuery needs dlt's own native destination, authenticated via a \
+service-account key, not a connection string of any kind) and follow the \
+separate BigQuery Destination section below instead. If \
+DEST_BIGQUERY_PROJECT_ID is absent, proceed with the SQL destination rules \
+below exactly as always.
 - The actual destination database engine (SQLite, Postgres, or otherwise) is \
 not known to you and can vary at runtime. NEVER use an engine-specific \
 destination like `dlt.destinations.postgres(...)`, `dlt.destinations.mysql(...)`, \
@@ -592,6 +621,155 @@ building a set of ids, or a simple string cache) should use dest_client.sadd \
 / dest_client.set / etc. instead of hset - hash is the right DEFAULT for a \
 generic "load these records into Redis" goal, not a rule with no \
 exceptions.
+
+Snowflake Destination — only relevant when DEST_SNOWFLAKE_ACCOUNT is set \
+(see the check at the top of Destination Requirements above); skip this \
+entire section otherwise:
+- Snowflake has its own NATIVE dlt destination - use it directly, never \
+the generic SQLAlchemy destination this file's own SQL destination rules \
+describe above. Its real, preferred load mechanism is staged-file bulk \
+loading (COPY INTO), genuinely different from the row-by-row inserts the \
+generic SQLAlchemy destination does - confirmed directly against dlt's own \
+official docs, not assumed.
+- Build the destination exactly like this - DEST_SNOWFLAKE_WAREHOUSE and \
+DEST_SNOWFLAKE_ROLE may both be absent (some Snowflake accounts have \
+defaults assigned to the user and need neither), so include them \
+conditionally, never assume either is set:
+
+      import os
+      import dlt
+
+      snowflake_credentials = {
+          "database": os.environ["DEST_SNOWFLAKE_DATABASE"],
+          "username": os.environ["DEST_SNOWFLAKE_USER"],
+          "password": os.environ["DEST_SNOWFLAKE_PASSWORD"],
+          "host": os.environ["DEST_SNOWFLAKE_ACCOUNT"],
+      }
+      if os.environ.get("DEST_SNOWFLAKE_WAREHOUSE"):
+          snowflake_credentials["warehouse"] = os.environ["DEST_SNOWFLAKE_WAREHOUSE"]
+      if os.environ.get("DEST_SNOWFLAKE_ROLE"):
+          snowflake_credentials["role"] = os.environ["DEST_SNOWFLAKE_ROLE"]
+
+      pipeline = dlt.pipeline(
+          pipeline_name="...",
+          destination=dlt.destinations.snowflake(credentials=snowflake_credentials),
+          dataset_name="...",  # the schema half of destination_table, same convention as every other destination in this file
+      )
+
+  Everything else - the @dlt.resource generator reading and yielding \
+records, pipeline.run(...), write_disposition - works exactly as it does \
+for any other destination in this file. Only the destination= construction \
+itself differs. Do NOT set schema_contract or any pinned-schema-specific \
+options here unless this file's own goal text explicitly describes a \
+pinned schema for it - Snowflake destinations do not support that feature \
+in this project yet.
+
+S3 Destination — only relevant when DEST_S3_BUCKET_URL is set (see the \
+check at the top of Destination Requirements above); skip this entire \
+section otherwise:
+- This covers real AWS S3 and any S3-API-compatible service (e.g. MinIO) \
+identically - the same construction works for both. There is no \
+dlt.destinations.s3 - object storage uses dlt's filesystem destination, \
+which writes Parquet/JSONL files into the bucket rather than rows into a \
+SQL table. Genuinely no CREATE TABLE, no schema_contract, no pinned-schema \
+concept of any kind applies here - do not attempt any of them.
+- Build the destination exactly like this - DEST_S3_REGION and \
+DEST_S3_ENDPOINT_URL may both be absent (real AWS S3 usually needs \
+neither; DEST_S3_ENDPOINT_URL is what's actually set for MinIO or another \
+S3-compatible service), so include them conditionally, never assume either \
+is set:
+
+      import os
+      import dlt
+
+      s3_credentials = {
+          "aws_access_key_id": os.environ["DEST_S3_ACCESS_KEY_ID"],
+          "aws_secret_access_key": os.environ["DEST_S3_SECRET_ACCESS_KEY"],
+      }
+      if os.environ.get("DEST_S3_REGION"):
+          s3_credentials["region_name"] = os.environ["DEST_S3_REGION"]
+      if os.environ.get("DEST_S3_ENDPOINT_URL"):
+          s3_credentials["endpoint_url"] = os.environ["DEST_S3_ENDPOINT_URL"]
+
+      pipeline = dlt.pipeline(
+          pipeline_name="...",
+          destination=dlt.destinations.filesystem(
+              bucket_url=os.environ["DEST_S3_BUCKET_URL"],
+              credentials=s3_credentials,
+          ),
+          dataset_name="...",  # the schema half of destination_table - becomes a folder path prefix within the bucket, not a SQL schema, but the same parsing convention still applies
+      )
+
+  Everything else - the @dlt.resource generator reading and yielding \
+records, pipeline.run(...) - works exactly as it does for any other \
+destination in this file. table_name on @dlt.resource still controls how \
+the written files are organized within the bucket; dlt handles that \
+internally, nothing extra to do here.
+
+Azure Blob Storage Destination — only relevant when \
+DEST_AZURE_BLOB_BUCKET_URL is set (see the check at the top of \
+Destination Requirements above); skip this entire section otherwise:
+- The exact same reasoning as the S3 Destination section above applies - \
+this is dlt's filesystem destination again, just with an az:// bucket_url \
+scheme instead of s3://. Genuinely no SQL concept of any kind, no CREATE \
+TABLE, no schema_contract, no pinned-schema concept - do not attempt any \
+of them.
+- Build the destination exactly like this:
+
+      import os
+      import dlt
+
+      pipeline = dlt.pipeline(
+          pipeline_name="...",
+          destination=dlt.destinations.filesystem(
+              bucket_url=os.environ["DEST_AZURE_BLOB_BUCKET_URL"],
+              credentials={
+                  "azure_storage_account_name": os.environ["DEST_AZURE_BLOB_ACCOUNT_NAME"],
+                  "azure_storage_account_key": os.environ["DEST_AZURE_BLOB_ACCOUNT_KEY"],
+              },
+          ),
+          dataset_name="...",  # the schema half of destination_table - becomes a folder path prefix within the container, not a SQL schema, same convention as everywhere else in this file
+      )
+
+  Everything else - the @dlt.resource generator reading and yielding \
+records, pipeline.run(...) - works exactly as it does for any other \
+destination in this file.
+
+BigQuery Destination — only relevant when DEST_BIGQUERY_PROJECT_ID is set \
+(see the check at the top of Destination Requirements above); skip this \
+entire section otherwise:
+- BigQuery has its own NATIVE dlt destination - use it directly, never the \
+generic SQLAlchemy destination this file's own SQL destination rules \
+describe above. Authenticated via a service-account credentials dict, not \
+a connection string - confirmed directly against dlt's own official docs, \
+not assumed.
+- Build the destination exactly like this. DEST_BIGQUERY_LOCATION is \
+always present (defaults to "US" if the profile never set one), so it can \
+be used directly, unlike Snowflake's optional fields above:
+
+      import os
+      import dlt
+
+      pipeline = dlt.pipeline(
+          pipeline_name="...",
+          destination=dlt.destinations.bigquery(
+              credentials={
+                  "project_id": os.environ["DEST_BIGQUERY_PROJECT_ID"],
+                  "private_key": os.environ["DEST_BIGQUERY_PRIVATE_KEY"],
+                  "client_email": os.environ["DEST_BIGQUERY_CLIENT_EMAIL"],
+              },
+              location=os.environ["DEST_BIGQUERY_LOCATION"],
+          ),
+          dataset_name="...",  # the schema half of destination_table, same convention as every other destination in this file
+      )
+
+  Everything else - the @dlt.resource generator reading and yielding \
+records, pipeline.run(...), write_disposition - works exactly as it does \
+for any other destination in this file. Only the destination= construction \
+itself differs. Do NOT set schema_contract or any pinned-schema-specific \
+options here unless this file's own goal text explicitly describes a \
+pinned schema for it - BigQuery destinations do not support that feature \
+in this project yet.
 
 Data Shape Requirements:
 - Never yield a native Python list or dict as a field's value unless you \

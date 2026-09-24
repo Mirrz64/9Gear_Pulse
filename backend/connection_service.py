@@ -63,6 +63,34 @@ def _validate_postgres_shape(credentials: dict[str, Any]) -> None:
         )
 
 
+def _validate_azure_sql_shape(credentials: dict[str, Any]) -> None:
+    """Mirrors _validate_postgres_shape exactly - Azure SQL Database's
+    real credential shape (host/database/username/password, port
+    defaulting to 1433) is close enough to Postgres's own that there's
+    no reason to diverge from an already-proven pattern. The one
+    genuine difference is the connection mechanism itself: Azure SQL
+    uses pymssql (a pure-Python wheel, confirmed against real sources
+    to need no separate system-level driver install, unlike pyodbc -
+    the Microsoft ODBC Driver dlt's own docs say plainly "cannot be
+    included with dlt's Python dependencies" and must be installed
+    separately on the system, which the sandbox has no mechanism for
+    at all, only pip installs) - see azure_sql_url() for where that
+    actually surfaces, in the connection string's own dialect prefix.
+    """
+    schema = credentials.get("schema")
+    if schema is not None and not isinstance(schema, str):
+        raise CredentialResolutionError("Azure SQL schema must be a string if provided.")
+    if "database_url" in credentials:
+        return
+    required = ("host", "database", "username", "password")
+    missing = [key for key in required if not credentials.get(key)]
+    if missing:
+        raise CredentialResolutionError(
+            "Azure SQL credentials require either database_url, or all of "
+            f"host/database/username/password - missing: {', '.join(missing)}."
+        )
+
+
 def _validate_auth_method(credentials: dict[str, Any]) -> None:
     """Shared between _validate_api_shape and _validate_graphql_shape -
     both connection types authenticate the exact same two ways (static
@@ -237,6 +265,114 @@ def _validate_redis_shape(credentials: dict[str, Any]) -> None:
         )
 
 
+def _validate_bigquery_shape(credentials: dict[str, Any]) -> None:
+    """Genuinely different validation shape from everything else in this
+    module - BigQuery auth is a service-account JSON key, not flat
+    fields, so this stores the WHOLE pasted JSON blob as one field
+    (service_account_json) rather than asking a user to manually copy
+    three separate fields (project_id/private_key/client_email) out of
+    the file Google actually hands them - error-prone, especially for
+    the multiline private_key. Parsed and validated here so a
+    malformed paste is caught immediately at profile-creation time,
+    not the first time generation tries to use it.
+
+    location is a genuinely separate, optional destination-level
+    setting (not part of the credentials Google issues at all) -
+    confirmed directly against dlt's own docs, defaulting to "US" if
+    never set.
+    """
+    raw_json = credentials.get("service_account_json")
+    if not raw_json or not isinstance(raw_json, str):
+        raise CredentialResolutionError("BigQuery credentials require the full service account JSON key, pasted in as service_account_json.")
+    try:
+        parsed = json.loads(raw_json)
+    except json.JSONDecodeError as exc:
+        raise CredentialResolutionError(f"service_account_json is not valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise CredentialResolutionError("service_account_json must be a JSON object.")
+    missing = [key for key in ("project_id", "private_key", "client_email") if not parsed.get(key)]
+    if missing:
+        raise CredentialResolutionError(
+            f"service_account_json is missing required field(s): {', '.join(missing)} - make sure the whole downloaded key file was pasted in."
+        )
+    location = credentials.get("location")
+    if location is not None and not isinstance(location, str):
+        raise CredentialResolutionError("BigQuery location must be a string if provided.")
+
+
+def _validate_azure_blob_shape(credentials: dict[str, Any]) -> None:
+    """Confirmed directly against dlt's own official docs, not assumed -
+    Azure Blob Storage shares S3's exact same filesystem destination
+    mechanism (dispatched by bucket_url scheme, az:// here instead of
+    s3://), but its real credential fields are genuinely different:
+    azure_storage_account_name and azure_storage_account_key, not
+    aws_access_key_id/aws_secret_access_key. This is why it gets its
+    own connection type rather than sharing S3's - a user picking
+    Azure Blob shouldn't see AWS-shaped fields, and vice versa.
+
+    Scoped to account-key auth only, the one form of Azure credentials
+    directly confirmed - dlt's docs mention "two forms of Azure
+    credentials" but the second (likely a SAS token) was never
+    actually confirmed, so it's deliberately left out rather than
+    guessed at.
+    """
+    required = ("container", "azure_storage_account_name", "azure_storage_account_key")
+    missing = [key for key in required if not credentials.get(key)]
+    if missing:
+        raise CredentialResolutionError(
+            f"Azure Blob Storage credentials require container, azure_storage_account_name, and azure_storage_account_key - missing: {', '.join(missing)}."
+        )
+
+
+def _validate_s3_shape(credentials: dict[str, Any]) -> None:
+    """Confirmed directly against dlt's own official docs, not assumed -
+    dlt's filesystem destination (which S3 uses - there is no separate
+    dlt.destinations.s3) takes aws_access_key_id/aws_secret_access_key
+    as its real credential fields, with region_name and endpoint_url
+    both genuinely optional. endpoint_url specifically is what makes
+    MinIO (and any other S3-API-compatible service, e.g. Cloudflare
+    R2) work through this exact same shape, confirmed directly against
+    dlt's own real R2 example - it needs no separate connection type
+    of its own.
+    """
+    required = ("bucket", "aws_access_key_id", "aws_secret_access_key")
+    missing = [key for key in required if not credentials.get(key)]
+    if missing:
+        raise CredentialResolutionError(
+            f"S3 credentials require bucket, aws_access_key_id, and aws_secret_access_key - missing: {', '.join(missing)}."
+        )
+    for optional_field in ("region", "endpoint_url"):
+        value = credentials.get(optional_field)
+        if value is not None and not isinstance(value, str):
+            raise CredentialResolutionError(f"S3 {optional_field} must be a string if provided.")
+
+
+def _validate_snowflake_shape(credentials: dict[str, Any]) -> None:
+    """Confirmed directly against dlt's own official docs, not assumed -
+    account/username/password/database are required; warehouse and
+    role are genuinely optional ("optional if you assign defaults to
+    your user", per dlt's real setup guide).
+
+    The field is named "account" here, not "host" - dlt's own
+    credentials dict calls it "host", but that's a confusing name for
+    what is actually a Snowflake account identifier (e.g.
+    "kgiotue-wn98412"), not a hostname or IP. snowflake_credentials()
+    does the rename to dlt's own expected field name at resolution
+    time, keeping the user-facing name honest without needing dlt's
+    own naming to change.
+    """
+    required = ("account", "username", "password", "database")
+    missing = [key for key in required if not credentials.get(key)]
+    if missing:
+        raise CredentialResolutionError(
+            f"Snowflake credentials require account, username, password, and database - missing: {', '.join(missing)}."
+        )
+    for optional_field in ("warehouse", "role"):
+        value = credentials.get(optional_field)
+        if value is not None and not isinstance(value, str):
+            raise CredentialResolutionError(f"Snowflake {optional_field} must be a string if provided.")
+
+
 def validate_credentials_shape(connection_type: ConnectionType, credentials: dict[str, Any]) -> None:
     """Checked once at connection-profile creation time, so a malformed
     credentials payload fails immediately and clearly instead of only
@@ -245,6 +381,16 @@ def validate_credentials_shape(connection_type: ConnectionType, credentials: dic
     """
     if connection_type == ConnectionType.postgres:
         _validate_postgres_shape(credentials)
+    elif connection_type == ConnectionType.azure_sql:
+        _validate_azure_sql_shape(credentials)
+    elif connection_type == ConnectionType.snowflake:
+        _validate_snowflake_shape(credentials)
+    elif connection_type == ConnectionType.s3:
+        _validate_s3_shape(credentials)
+    elif connection_type == ConnectionType.azure_blob:
+        _validate_azure_blob_shape(credentials)
+    elif connection_type == ConnectionType.bigquery:
+        _validate_bigquery_shape(credentials)
     elif connection_type == ConnectionType.api:
         _validate_api_shape(credentials)
     elif connection_type == ConnectionType.file:
@@ -257,7 +403,7 @@ def validate_credentials_shape(connection_type: ConnectionType, credentials: dic
         _validate_soap_shape(credentials)
     else:
         raise CredentialResolutionError(
-            f"Only Postgres, API, file, Redis, GraphQL, and SOAP connection profiles are supported in v1 (got '{connection_type.value}')."
+            f"Only Postgres, Azure SQL, Snowflake, S3, Azure Blob Storage, BigQuery, API, file, Redis, GraphQL, and SOAP connection profiles are supported in v1 (got '{connection_type.value}')."
         )
 
 
@@ -274,6 +420,25 @@ def postgres_url(profile: ConnectionProfile) -> str:
     return f"postgresql://{credentials['username']}:{credentials['password']}@{credentials['host']}:{port}/{credentials['database']}"
 
 
+def azure_sql_url(profile: ConnectionProfile) -> str:
+    """Mirrors postgres_url() exactly. mssql+pymssql, never mssql+pyodbc -
+    pymssql is a pure-Python wheel needing no separate system-level
+    driver install, confirmed directly against real sources; pyodbc
+    needs the Microsoft ODBC Driver installed at the OS level, which
+    the sandbox (pip installs only, no apt-get) has no way to do.
+    """
+    credentials = decrypt_credentials(profile)
+    if "database_url" in credentials:
+        return str(credentials["database_url"])
+    required = ("host", "database", "username", "password")
+    if any(not credentials.get(key) for key in required):
+        raise CredentialResolutionError(
+            "Azure SQL credentials require database_url or host, database, username, and password."
+        )
+    port = credentials.get("port", 1433)
+    return f"mssql+pymssql://{credentials['username']}:{credentials['password']}@{credentials['host']}:{port}/{credentials['database']}"
+
+
 def postgres_schema_name(profile: ConnectionProfile) -> str:
     """Resolves which schema a Postgres source or destination should be
     introspected/read from. Defaults to "public" so every profile
@@ -284,6 +449,18 @@ def postgres_schema_name(profile: ConnectionProfile) -> str:
     """
     credentials = decrypt_credentials(profile)
     return credentials.get("schema") or "public"
+
+
+def azure_sql_schema_name(profile: ConnectionProfile) -> str:
+    """Mirrors postgres_schema_name() exactly, with one genuinely
+    different default: SQL Server's (and therefore Azure SQL's) own
+    conventional default schema is "dbo", not "public" - copying
+    Postgres's default here would silently look in the wrong schema
+    for the overwhelming majority of real Azure SQL databases, which
+    never rename their default schema away from dbo.
+    """
+    credentials = decrypt_credentials(profile)
+    return credentials.get("schema") or "dbo"
 
 
 def api_credentials(profile: ConnectionProfile) -> dict[str, Any]:
@@ -440,4 +617,121 @@ def soap_credentials(profile: ConnectionProfile) -> dict[str, Any]:
         "request_body": request_body,
         "auth_headers": credentials.get("auth_headers") or {},
         "oauth2": credentials.get("oauth2"),
+    }
+
+
+def snowflake_credentials(profile: ConnectionProfile) -> dict[str, Any]:
+    """Returns the dict shape dlt.destinations.snowflake(credentials={...})
+    itself expects - confirmed directly against dlt's own docs, not
+    assumed. Deliberately a dict, not a connection string like
+    postgres_url()/azure_sql_url() - Snowflake's real, preferred load
+    mechanism is staged-file bulk loading (COPY INTO), which needs
+    dlt's own native Snowflake destination, not the generic SQLAlchemy
+    one every other SQL-like destination in this project reuses.
+
+    Renames "account" (this profile's own field name, chosen for
+    clarity - see _validate_snowflake_shape's docstring) to "host"
+    (dlt's own expected field name) here, at resolution time - the one
+    place that mapping needs to happen.
+    """
+    credentials = decrypt_credentials(profile)
+    account = credentials.get("account")
+    username = credentials.get("username")
+    password = credentials.get("password")
+    database = credentials.get("database")
+    if not all([account, username, password, database]):
+        raise CredentialResolutionError("Snowflake credentials require account, username, password, and database.")
+    result = {
+        "host": account,
+        "username": username,
+        "password": password,
+        "database": database,
+    }
+    if credentials.get("warehouse"):
+        result["warehouse"] = credentials["warehouse"]
+    if credentials.get("role"):
+        result["role"] = credentials["role"]
+    return result
+
+
+def s3_credentials(profile: ConnectionProfile) -> dict[str, Any]:
+    """Returns bucket_url (dlt.destinations.filesystem's own real
+    parameter, built here as "s3://<bucket>" - confirmed directly
+    against dlt's docs, not assumed) plus the credentials dict it
+    expects. Renames "region" (this profile's own field name) to
+    "region_name" (dlt's own expected field name) here, at resolution
+    time, mirroring the exact same account->host rename
+    snowflake_credentials() already does for the same reason - a
+    clearer name for the user, translated to what dlt actually wants
+    at the one place that needs to happen.
+
+    endpoint_url is what makes this same shape work for MinIO (or any
+    other S3-API-compatible service) - included only when actually
+    set, since real AWS S3 needs no override at all.
+    """
+    credentials = decrypt_credentials(profile)
+    bucket = credentials.get("bucket")
+    access_key = credentials.get("aws_access_key_id")
+    secret_key = credentials.get("aws_secret_access_key")
+    if not all([bucket, access_key, secret_key]):
+        raise CredentialResolutionError("S3 credentials require bucket, aws_access_key_id, and aws_secret_access_key.")
+    result = {
+        "bucket_url": f"s3://{bucket}",
+        "aws_access_key_id": access_key,
+        "aws_secret_access_key": secret_key,
+    }
+    if credentials.get("region"):
+        result["region_name"] = credentials["region"]
+    if credentials.get("endpoint_url"):
+        result["endpoint_url"] = credentials["endpoint_url"]
+    return result
+
+
+def azure_blob_credentials(profile: ConnectionProfile) -> dict[str, Any]:
+    """Mirrors s3_credentials() exactly - same filesystem destination
+    mechanism, same bucket_url-plus-credentials-dict shape, just
+    az:// instead of s3:// and genuinely different credential field
+    names (confirmed directly against dlt's own docs, not assumed).
+    """
+    credentials = decrypt_credentials(profile)
+    container = credentials.get("container")
+    account_name = credentials.get("azure_storage_account_name")
+    account_key = credentials.get("azure_storage_account_key")
+    if not all([container, account_name, account_key]):
+        raise CredentialResolutionError("Azure Blob Storage credentials require container, azure_storage_account_name, and azure_storage_account_key.")
+    return {
+        "bucket_url": f"az://{container}",
+        "azure_storage_account_name": account_name,
+        "azure_storage_account_key": account_key,
+    }
+
+
+def bigquery_credentials(profile: ConnectionProfile) -> dict[str, Any]:
+    """Parses the stored service_account_json (the whole file Google
+    issued, pasted in as-is) and extracts exactly the three fields dlt
+    actually needs - project_id, private_key, client_email - plus the
+    separate, optional location setting (defaulting to "US", dlt's own
+    real default, confirmed directly against its docs). The extra
+    fields a real Google-issued key file contains (type, private_key_id,
+    client_id, auth_uri, token_uri, ...) are simply ignored - dlt never
+    needs them.
+    """
+    credentials = decrypt_credentials(profile)
+    raw_json = credentials.get("service_account_json")
+    if not raw_json:
+        raise CredentialResolutionError("BigQuery credentials require service_account_json.")
+    try:
+        parsed = json.loads(raw_json)
+    except json.JSONDecodeError as exc:
+        raise CredentialResolutionError(f"service_account_json is not valid JSON: {exc}") from exc
+    project_id = parsed.get("project_id")
+    private_key = parsed.get("private_key")
+    client_email = parsed.get("client_email")
+    if not all([project_id, private_key, client_email]):
+        raise CredentialResolutionError("service_account_json is missing project_id, private_key, or client_email.")
+    return {
+        "project_id": project_id,
+        "private_key": private_key,
+        "client_email": client_email,
+        "location": credentials.get("location") or "US",
     }

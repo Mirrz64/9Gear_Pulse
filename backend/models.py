@@ -69,6 +69,16 @@ class ProjectStatus(str, enum.Enum):
     archived = "archived"
 
 
+class LoadPattern(str, enum.Enum):
+    # A user's stated preference for how the destination table should
+    # be maintained, surfaced to propose_architecture.py so the AI's
+    # approach and build plan reflect it rather than having to guess -
+    # maps closely to dlt's own write_disposition concept downstream.
+    full_refresh = "full_refresh"
+    append_only = "append_only"
+    incremental = "incremental"
+
+
 class ConnectionType(str, enum.Enum):
     postgres = "postgres"
     snowflake = "snowflake"
@@ -79,6 +89,8 @@ class ConnectionType(str, enum.Enum):
     redis = "redis"
     graphql = "graphql"
     soap = "soap"
+    azure_sql = "azure_sql"
+    azure_blob = "azure_blob"
 
 
 class PipelineStatus(str, enum.Enum):
@@ -165,6 +177,21 @@ class Project(Base):
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     goal_description: Mapped[str] = mapped_column(Text, nullable=False)
+    # All four genuinely optional, by design - captured at project
+    # creation to give propose_architecture.py more to reason with
+    # than the bare goal alone, but never required to create a
+    # project. objectives elaborates on the goal itself; dataset_notes
+    # covers semantic meaning the schema's structure alone can't
+    # convey (e.g. what a status code actually means); known_constraints
+    # covers operational realities (rate limits, expected duplicates);
+    # load_pattern is the one genuinely structured choice among the
+    # four, not free text.
+    objectives: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    dataset_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    known_constraints: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    load_pattern: Mapped[Optional[LoadPattern]] = mapped_column(
+        SAEnum(LoadPattern, name="load_pattern"), nullable=True
+    )
     status: Mapped[ProjectStatus] = mapped_column(
         SAEnum(ProjectStatus, name="project_status"),
         default=ProjectStatus.active,

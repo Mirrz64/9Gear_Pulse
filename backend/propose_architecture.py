@@ -153,6 +153,38 @@ A file whose reads_from includes a Redis pattern must mention in its \
 purpose which redis_type it's reading, since that directly determines how \
 the file's code will need to read each key.
 
+Up to four more fields may appear in the input beyond schema_summary and \
+goal, each present only when the project's creator actually filled it in - \
+never assume any of them are there, and never treat their absence as \
+missing information to ask about:
+
+- objectives, when present, elaborates on WHY this project exists and what \
+a successful outcome looks like, beyond the bare goal statement. Treat it \
+as extending the goal itself, not as a separate or competing requirement -\
+ fold it into your understanding of what's actually being asked for.
+- dataset_notes, when present, explains what raw values in the schema \
+actually MEAN - things the schema's structure alone can't convey, like a \
+status column's codes mapping to specific business states, or a field's \
+real-world units or conventions. Reflect this directly in key_transformations \
+and approach: if dataset_notes says a code means something specific, your \
+proposed transformation should say so too, not leave it as an opaque \
+pass-through.
+- known_constraints, when present, describes operational realities to \
+design around - things like an API's rate limit, expected duplicate \
+records needing a dedup step, or a known data quality issue in the source. \
+Reflect these in assumptions, and in the file-by-file build plan itself \
+where they genuinely change what needs building (e.g. a known-duplicates \
+constraint may mean the plan needs a step that dedupes by a stated key \
+before writing the final destination).
+- load_pattern, when present, is the project creator's stated preference \
+for how the destination table should be maintained: "full_refresh" (replace \
+the destination entirely each run), "append_only" (only ever add new \
+records, never modify existing ones), or "incremental" (update changed \
+records and add new ones, based on a key - an upsert/merge). State which \
+pattern the approach follows explicitly, and when it's "incremental", the \
+build plan should make clear what key or watermark column the merge is \
+based on, if the schema makes that determinable.
+
 If feasible, describe the intended approach in plain language: which real \
 tables you'll read (source_tables_used - actual names from schema_summary, \
 never names you're introducing), what transformation logic will happen \
@@ -256,8 +288,29 @@ Do not write any code. This is a plan for a human to review before code \
 generation begins."""
 
 
-def propose_architecture(schema_summary: dict, goal: str) -> dict:
-    user_content = json.dumps({"schema_summary": schema_summary, "goal": goal}, default=str)
+def propose_architecture(
+    schema_summary: dict,
+    goal: str,
+    objectives: Optional[str] = None,
+    dataset_notes: Optional[str] = None,
+    known_constraints: Optional[str] = None,
+    load_pattern: Optional[str] = None,
+) -> dict:
+    payload = {"schema_summary": schema_summary, "goal": goal}
+    # Each included only when actually set - a project created before
+    # these fields existed, or one where a user skipped them (they're
+    # genuinely optional), sends exactly the same payload this
+    # function has always sent, rather than four empty/null fields
+    # cluttering every request.
+    if objectives:
+        payload["objectives"] = objectives
+    if dataset_notes:
+        payload["dataset_notes"] = dataset_notes
+    if known_constraints:
+        payload["known_constraints"] = known_constraints
+    if load_pattern:
+        payload["load_pattern"] = load_pattern
+    user_content = json.dumps(payload, default=str)
 
     if anthropic_client:
         try:
@@ -310,9 +363,13 @@ if __name__ == "__main__":
     schema = introspect_schema()
 
     goal = input("Describe the pipeline goal (plain English): ")
+    objectives = input("Objectives (optional, press enter to skip): ").strip() or None
+    dataset_notes = input("Dataset notes (optional, press enter to skip): ").strip() or None
+    known_constraints = input("Known constraints (optional, press enter to skip): ").strip() or None
+    load_pattern = input("Load pattern - full_refresh/append_only/incremental (optional, press enter to skip): ").strip() or None
     print("\nAssessing feasibility and proposing an architecture...\n")
 
-    result = propose_architecture(schema, goal)
+    result = propose_architecture(schema, goal, objectives, dataset_notes, known_constraints, load_pattern)
 
     print(f"Feasible: {result['feasible']}")
     print(f"Notes: {result['feasibility_notes']}")

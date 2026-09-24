@@ -34,6 +34,7 @@ from models import (
     ConnectionProfile,
     ConnectionProfileFile,
     ConnectionType,
+    LoadPattern,
     Pipeline,
     PipelineReview,
     PipelineReviewAction,
@@ -51,7 +52,7 @@ from models import (
 )
 from session import get_db
 from connection_service import (
-    CredentialResolutionError, api_credentials, decrypt_credentials, file_credentials,
+    CredentialResolutionError, api_credentials, azure_sql_schema_name, azure_sql_url, decrypt_credentials, file_credentials,
     graphql_credentials, postgres_url, postgres_schema_name, redis_url, soap_credentials, validate_credentials_shape,
 )
 from introspect import introspect_api, introspect_files, introspect_graphql, introspect_redis, introspect_schema, introspect_soap
@@ -69,6 +70,15 @@ router = APIRouter(prefix="/api/v2", tags=["review gate"])
 class CreateProjectRequest(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     goal_description: str = Field(min_length=1)
+    # All four genuinely optional - see Project model's own docstring
+    # for what each is for. load_pattern typed as the real enum (not
+    # a bare str) so an invalid value is rejected with a clear 422 at
+    # the API boundary, the same way every other enum-typed field in
+    # this file already works.
+    objectives: Optional[str] = None
+    dataset_notes: Optional[str] = None
+    known_constraints: Optional[str] = None
+    load_pattern: Optional[LoadPattern] = None
 
 
 class UpdateProjectRequest(BaseModel):
@@ -308,13 +318,25 @@ def list_projects(db: Session = Depends(get_db), current_user: User = Depends(ge
 
 @router.post("/projects", status_code=status.HTTP_201_CREATED)
 def create_project(body: CreateProjectRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    project = Project(owner_id=current_user.id, name=body.name.strip(), goal_description=body.goal_description.strip())
+    project = Project(
+        owner_id=current_user.id,
+        name=body.name.strip(),
+        goal_description=body.goal_description.strip(),
+        objectives=body.objectives.strip() if body.objectives and body.objectives.strip() else None,
+        dataset_notes=body.dataset_notes.strip() if body.dataset_notes and body.dataset_notes.strip() else None,
+        known_constraints=body.known_constraints.strip() if body.known_constraints and body.known_constraints.strip() else None,
+        load_pattern=body.load_pattern,
+    )
     db.add(project)
     db.flush()
     _audit(db, current_user.id, "project.created", "project", project.id)
     db.commit()
     db.refresh(project)
-    return {"id": project.id, "name": project.name, "goal_description": project.goal_description}
+    return {
+        "id": project.id, "name": project.name, "goal_description": project.goal_description,
+        "objectives": project.objectives, "dataset_notes": project.dataset_notes,
+        "known_constraints": project.known_constraints, "load_pattern": project.load_pattern,
+    }
 
 
 @router.get("/projects/{project_id}")
@@ -326,6 +348,8 @@ def get_project(project_id: uuid.UUID, db: Session = Depends(get_db), current_us
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
     return {"id": project.id, "name": project.name, "goal_description": project.goal_description,
+            "objectives": project.objectives, "dataset_notes": project.dataset_notes,
+            "known_constraints": project.known_constraints, "load_pattern": project.load_pattern,
             "status": project.status, "category": _derive_project_category(project.pipelines),
             "created_at": project.created_at}
 
@@ -735,6 +759,13 @@ def introspect_connection_profile(profile_id: uuid.UUID, db: Session = Depends(g
             schema = introspect_schema(
                 db_url=postgres_url(profile), schema_name=postgres_schema_name(profile), sample_rows=0,
             )
+        elif profile.type == ConnectionType.azure_sql:
+            # introspect_schema() itself needs no changes - confirmed
+            # it already works via generic SQLAlchemy reflection, not
+            # Postgres-specific queries.
+            schema = introspect_schema(
+                db_url=azure_sql_url(profile), schema_name=azure_sql_schema_name(profile), sample_rows=0,
+            )
         elif profile.type == ConnectionType.api:
             creds = api_credentials(profile)
             schema = introspect_api(
@@ -763,7 +794,7 @@ def introspect_connection_profile(profile_id: uuid.UUID, db: Session = Depends(g
                 source_name=profile.name, sample_rows=0,
             )
         else:
-            raise HTTPException(status_code=422, detail="Only Postgres, API, file, Redis, GraphQL, and SOAP connection profiles are supported in v1")
+            raise HTTPException(status_code=422, detail="Only Postgres, Azure SQL, API, file, Redis, GraphQL, and SOAP connection profiles are supported in v1")
     except CredentialResolutionError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except requests.RequestException as exc:
@@ -927,7 +958,13 @@ def propose_pipeline_architecture(pipeline_id: uuid.UUID, db: Session = Depends(
         )
 
     try:
-        proposal = propose_architecture(source.schema_metadata_json, goal)
+        proposal = propose_architecture(
+            source.schema_metadata_json, goal,
+            objectives=pipeline.project.objectives,
+            dataset_notes=pipeline.project.dataset_notes,
+            known_constraints=pipeline.project.known_constraints,
+            load_pattern=pipeline.project.load_pattern.value if pipeline.project.load_pattern else None,
+        )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Architecture proposal failed: {exc}") from exc
 

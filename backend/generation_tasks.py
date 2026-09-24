@@ -50,7 +50,7 @@ import sqlalchemy as sa
 
 from audit import _audit
 from celery_app import celery_app
-from connection_service import CredentialResolutionError, api_credentials, file_credentials, graphql_credentials, postgres_url, redis_url, soap_credentials
+from connection_service import CredentialResolutionError, api_credentials, azure_blob_credentials, azure_sql_url, bigquery_credentials, file_credentials, graphql_credentials, postgres_url, redis_url, s3_credentials, snowflake_credentials, soap_credentials
 from introspect import introspect_schema
 from models import (
     ConnectionType,
@@ -167,6 +167,12 @@ def _resolve_source_execution_params(source):
         # of any one file's storage_path is that shared directory.
         files_dir = os.path.dirname(files[0]["storage_path"])
         return None, None, False, files_dir
+    if source.type == ConnectionType.azure_sql:
+        # introspect_schema() already works here with zero changes -
+        # its own docstring confirms it works via generic SQLAlchemy
+        # reflection, not Postgres-specific queries, so any valid
+        # SQLAlchemy connection string is enough.
+        return azure_sql_url(source), None, True, None
     return postgres_url(source), None, True, None
 
 
@@ -200,6 +206,81 @@ def _resolve_destination_execution_params(destination):
     """
     if destination.type == ConnectionType.redis:
         return None, {"DEST_REDIS_URL": redis_url(destination)}, False
+    if destination.type == ConnectionType.azure_sql:
+        # Same generic-SQLAlchemy mechanism as Postgres, confirmed - no
+        # extra_env, no dedicated destination-construction branch needed
+        # in generate_pipeline.py at all. Only the connection string
+        # itself differs (mssql+pymssql instead of postgresql), which
+        # azure_sql_url() already produces in the same shape
+        # postgres_url() does.
+        return azure_sql_url(destination), {}, True
+    if destination.type == ConnectionType.snowflake:
+        # needs_dest_db=False, same reasoning as Redis above - this is
+        # NOT a generic SQL destination the sandbox's DEST_DB_URL
+        # machinery should touch at all. Snowflake's real, preferred
+        # load mechanism is dlt's own native destination (staged-file
+        # bulk loading via COPY INTO), which needs several separate
+        # named fields, not one connection string - so destination_url
+        # is None here and every field goes through extra_env instead,
+        # mirroring exactly how OAuth2's multiple separate credential
+        # fields already get passed this same way.
+        creds = snowflake_credentials(destination)
+        env = {
+            "DEST_SNOWFLAKE_ACCOUNT": creds["host"],
+            "DEST_SNOWFLAKE_USER": creds["username"],
+            "DEST_SNOWFLAKE_PASSWORD": creds["password"],
+            "DEST_SNOWFLAKE_DATABASE": creds["database"],
+        }
+        if creds.get("warehouse"):
+            env["DEST_SNOWFLAKE_WAREHOUSE"] = creds["warehouse"]
+        if creds.get("role"):
+            env["DEST_SNOWFLAKE_ROLE"] = creds["role"]
+        return None, env, False
+    if destination.type == ConnectionType.s3:
+        # needs_dest_db=False - there is no dlt.destinations.s3 at all,
+        # and genuinely no CREATE TABLE/SQL concept for object storage
+        # to begin with. dlt's filesystem destination writes files
+        # (Parquet/JSONL) into the bucket instead, dispatched by
+        # bucket_url's own scheme - the destination_url slot stays
+        # unused here the same way it does for Snowflake, since the
+        # real connection info is bucket_url plus a credentials dict,
+        # not one single URL string.
+        creds = s3_credentials(destination)
+        env = {
+            "DEST_S3_BUCKET_URL": creds["bucket_url"],
+            "DEST_S3_ACCESS_KEY_ID": creds["aws_access_key_id"],
+            "DEST_S3_SECRET_ACCESS_KEY": creds["aws_secret_access_key"],
+        }
+        if creds.get("region_name"):
+            env["DEST_S3_REGION"] = creds["region_name"]
+        if creds.get("endpoint_url"):
+            env["DEST_S3_ENDPOINT_URL"] = creds["endpoint_url"]
+        return None, env, False
+    if destination.type == ConnectionType.azure_blob:
+        # Mirrors the S3 branch exactly - same filesystem destination
+        # mechanism, same needs_dest_db=False reasoning, just a
+        # different bucket_url scheme and genuinely different
+        # credential fields.
+        creds = azure_blob_credentials(destination)
+        env = {
+            "DEST_AZURE_BLOB_BUCKET_URL": creds["bucket_url"],
+            "DEST_AZURE_BLOB_ACCOUNT_NAME": creds["azure_storage_account_name"],
+            "DEST_AZURE_BLOB_ACCOUNT_KEY": creds["azure_storage_account_key"],
+        }
+        return None, env, False
+    if destination.type == ConnectionType.bigquery:
+        # needs_dest_db=False, same reasoning as Snowflake - BigQuery
+        # is authenticated via a service-account JSON key, genuinely
+        # not a connection string of any kind, and dlt's own native
+        # dlt.destinations.bigquery destination needs several separate
+        # fields, not one URL.
+        creds = bigquery_credentials(destination)
+        return None, {
+            "DEST_BIGQUERY_PROJECT_ID": creds["project_id"],
+            "DEST_BIGQUERY_PRIVATE_KEY": creds["private_key"],
+            "DEST_BIGQUERY_CLIENT_EMAIL": creds["client_email"],
+            "DEST_BIGQUERY_LOCATION": creds["location"],
+        }, False
     return postgres_url(destination), {}, True
 
 
