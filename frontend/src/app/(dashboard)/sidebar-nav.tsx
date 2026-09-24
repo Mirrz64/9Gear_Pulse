@@ -6,6 +6,7 @@ import Image from 'next/image';
 import { usePathname } from 'next/navigation';
 import { Show, UserButton } from '@clerk/nextjs';
 import { Menu, X } from 'lucide-react';
+import { CONNECTOR_CATEGORIES, categoryHref } from './connections/categories';
 
 const links = [
   { href: '/home', label: 'Home' },
@@ -78,15 +79,42 @@ export default function SidebarNav() {
           {links.map((link) => {
             const active = pathname === link.href || pathname.startsWith(`${link.href}/`);
             return (
-              <Link
-                key={link.href}
-                href={link.href}
-                className={`block rounded-lg px-3 py-2 text-xs font-semibold ${
-                  active ? 'bg-cyan-950 text-cyan-300' : 'text-slate-400 hover:bg-slate-900 hover:text-white'
-                }`}
-              >
-                {link.label}
-              </Link>
+              <div key={link.href}>
+                <Link
+                  href={link.href}
+                  className={`block rounded-lg px-3 py-2 text-xs font-semibold ${
+                    active ? 'bg-cyan-950 text-cyan-300' : 'text-slate-400 hover:bg-slate-900 hover:text-white'
+                  }`}
+                >
+                  {link.label}
+                </Link>
+
+                {/* Tied specifically to the Connections link itself, not
+                    to its position in the array - this is what the
+                    previous version got wrong: it rendered after the
+                    whole .map() finished, so it landed after whichever
+                    link happened to be last (Schedules), not actually
+                    under Connections at all. */}
+                {link.href === '/connections' && pathname.startsWith('/connections') && (
+                  <div className="ml-3 mt-1 space-y-0.5 border-l border-slate-800 pl-3">
+                    {CONNECTOR_CATEGORIES.map((category) => {
+                      const href = categoryHref(category);
+                      const catActive = pathname.startsWith(`/connections/${category.slug}`);
+                      return (
+                        <Link
+                          key={category.slug}
+                          href={href}
+                          className={`block rounded-lg px-2 py-1.5 text-[11px] font-semibold ${
+                            catActive ? 'text-cyan-300' : 'text-slate-500 hover:text-white'
+                          }`}
+                        >
+                          {category.label}
+                        </Link>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
             );
           })}
         </nav>

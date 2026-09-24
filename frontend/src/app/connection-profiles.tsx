@@ -6,7 +6,7 @@ import { CheckCircle2, Pencil, Plug, RefreshCw, Trash2, Upload, X } from 'lucide
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
 
-type SourceType = 'postgres' | 'api' | 'file' | 'redis' | 'graphql' | 'soap';
+export type SourceType = 'postgres' | 'azure_sql' | 'snowflake' | 's3' | 'azure_blob' | 'bigquery' | 'api' | 'file' | 'redis' | 'graphql' | 'soap';
 
 interface ConnectionProfile {
   id: string;
@@ -34,7 +34,23 @@ function getErrorMessage(payload: unknown): string {
 // getToken() below) - kept as a prop only so the parent's existing
 // wiring doesn't break before setup/page.tsx gets its own matching
 // cleanup pass.
-export default function ConnectionProfiles({ actorId }: { actorId?: string }) {
+export default function ConnectionProfiles({
+  actorId,
+  filterType,
+  filterLabel,
+}: {
+  actorId?: string;
+  // When provided, locks the create form to this one type (hiding the
+  // full type selector) and filters the list to just this type -
+  // backing the new per-connector pages. Omitted entirely, the
+  // component behaves exactly as it always has: every type selectable,
+  // every profile listed. filterLabel is the connector's own display
+  // name (e.g. "Postgres"), passed separately rather than derived
+  // in here from categories.ts - a generic, reusable component
+  // shouldn't depend on that route-specific data file.
+  filterType?: SourceType;
+  filterLabel?: string;
+}) {
   const { getToken } = useAuth();
   const [profiles, setProfiles] = useState<ConnectionProfile[]>([]);
   const [message, setMessage] = useState<string | null>(null);
@@ -71,6 +87,28 @@ export default function ConnectionProfiles({ actorId }: { actorId?: string }) {
   const [editUsername, setEditUsername] = useState('');
   const [editPassword, setEditPassword] = useState('');
   const [editSchema, setEditSchema] = useState('');
+  const [editAzureSqlHost, setEditAzureSqlHost] = useState('');
+  const [editAzureSqlPort, setEditAzureSqlPort] = useState('');
+  const [editAzureSqlDatabase, setEditAzureSqlDatabase] = useState('');
+  const [editAzureSqlUsername, setEditAzureSqlUsername] = useState('');
+  const [editAzureSqlPassword, setEditAzureSqlPassword] = useState('');
+  const [editAzureSqlSchema, setEditAzureSqlSchema] = useState('');
+  const [editSnowflakeAccount, setEditSnowflakeAccount] = useState('');
+  const [editSnowflakeUsername, setEditSnowflakeUsername] = useState('');
+  const [editSnowflakePassword, setEditSnowflakePassword] = useState('');
+  const [editSnowflakeDatabase, setEditSnowflakeDatabase] = useState('');
+  const [editSnowflakeWarehouse, setEditSnowflakeWarehouse] = useState('');
+  const [editSnowflakeRole, setEditSnowflakeRole] = useState('');
+  const [editS3Bucket, setEditS3Bucket] = useState('');
+  const [editS3AccessKeyId, setEditS3AccessKeyId] = useState('');
+  const [editS3SecretAccessKey, setEditS3SecretAccessKey] = useState('');
+  const [editS3Region, setEditS3Region] = useState('');
+  const [editS3EndpointUrl, setEditS3EndpointUrl] = useState('');
+  const [editAzureBlobContainer, setEditAzureBlobContainer] = useState('');
+  const [editAzureBlobAccountName, setEditAzureBlobAccountName] = useState('');
+  const [editAzureBlobAccountKey, setEditAzureBlobAccountKey] = useState('');
+  const [editBigqueryServiceAccountJson, setEditBigqueryServiceAccountJson] = useState('');
+  const [editBigqueryLocation, setEditBigqueryLocation] = useState('');
   const [editBaseUrl, setEditBaseUrl] = useState('');
   const [editAuthHeaderRows, setEditAuthHeaderRows] = useState<{ key: string; value: string }[]>([{ key: '', value: '' }]);
   // null means "leave the current method unchanged" - a toggle has no
@@ -120,6 +158,11 @@ export default function ConnectionProfiles({ actorId }: { actorId?: string }) {
     setEditingId(profile.id);
     setEditName(profile.name);
     setEditHost(''); setEditPort(''); setEditDatabase(''); setEditUsername(''); setEditPassword(''); setEditSchema('');
+    setEditAzureSqlHost(''); setEditAzureSqlPort(''); setEditAzureSqlDatabase(''); setEditAzureSqlUsername(''); setEditAzureSqlPassword(''); setEditAzureSqlSchema('');
+    setEditSnowflakeAccount(''); setEditSnowflakeUsername(''); setEditSnowflakePassword(''); setEditSnowflakeDatabase(''); setEditSnowflakeWarehouse(''); setEditSnowflakeRole('');
+    setEditS3Bucket(''); setEditS3AccessKeyId(''); setEditS3SecretAccessKey(''); setEditS3Region(''); setEditS3EndpointUrl('');
+    setEditAzureBlobContainer(''); setEditAzureBlobAccountName(''); setEditAzureBlobAccountKey('');
+    setEditBigqueryServiceAccountJson(''); setEditBigqueryLocation('');
     setEditBaseUrl(''); setEditAuthHeaderRows([{ key: '', value: '' }]);
     setEditApiMethod(null); setEditApiRequestBody('');
     setEditPaginationChanged(false); setEditPaginationStyle('offset');
@@ -142,7 +185,7 @@ export default function ConnectionProfiles({ actorId }: { actorId?: string }) {
   const updateEditAuthHeaderRow = (index: number, field: 'key' | 'value', value: string) =>
     setEditAuthHeaderRows((rows) => rows.map((row, i) => (i === index ? { ...row, [field]: value } : row)));
 
-  const [sourceType, setSourceType] = useState<SourceType>('postgres');
+  const [sourceType, setSourceType] = useState<SourceType>(filterType ?? 'postgres');
   const [name, setName] = useState('');
 
   // Postgres fields
@@ -152,6 +195,33 @@ export default function ConnectionProfiles({ actorId }: { actorId?: string }) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [schema, setSchema] = useState('');
+  // Azure SQL gets its own state rather than reusing Postgres's fields
+  // above, matching the established convention for every other
+  // connection type this session (redisHost vs host, soapEndpoint vs
+  // graphqlEndpoint) - avoids any cross-contamination if a user
+  // toggles between types while filling in the form.
+  const [azureSqlHost, setAzureSqlHost] = useState('');
+  const [azureSqlPort, setAzureSqlPort] = useState('1433');
+  const [azureSqlDatabase, setAzureSqlDatabase] = useState('');
+  const [azureSqlUsername, setAzureSqlUsername] = useState('');
+  const [azureSqlPassword, setAzureSqlPassword] = useState('');
+  const [azureSqlSchema, setAzureSqlSchema] = useState('');
+  const [snowflakeAccount, setSnowflakeAccount] = useState('');
+  const [snowflakeUsername, setSnowflakeUsername] = useState('');
+  const [snowflakePassword, setSnowflakePassword] = useState('');
+  const [snowflakeDatabase, setSnowflakeDatabase] = useState('');
+  const [snowflakeWarehouse, setSnowflakeWarehouse] = useState('');
+  const [snowflakeRole, setSnowflakeRole] = useState('');
+  const [s3Bucket, setS3Bucket] = useState('');
+  const [s3AccessKeyId, setS3AccessKeyId] = useState('');
+  const [s3SecretAccessKey, setS3SecretAccessKey] = useState('');
+  const [s3Region, setS3Region] = useState('');
+  const [s3EndpointUrl, setS3EndpointUrl] = useState('');
+  const [azureBlobContainer, setAzureBlobContainer] = useState('');
+  const [azureBlobAccountName, setAzureBlobAccountName] = useState('');
+  const [azureBlobAccountKey, setAzureBlobAccountKey] = useState('');
+  const [bigqueryServiceAccountJson, setBigqueryServiceAccountJson] = useState('');
+  const [bigqueryLocation, setBigqueryLocation] = useState('');
 
   // API fields - auth is a repeatable list of header name/value rows
   // rather than a single api-key field, since some APIs (e.g. RapidAPI)
@@ -253,6 +323,28 @@ export default function ConnectionProfiles({ actorId }: { actorId?: string }) {
     setUsername('');
     setPassword('');
     setSchema('');
+    setAzureSqlHost('');
+    setAzureSqlPort('1433');
+    setAzureSqlDatabase('');
+    setAzureSqlUsername('');
+    setAzureSqlPassword('');
+    setAzureSqlSchema('');
+    setSnowflakeAccount('');
+    setSnowflakeUsername('');
+    setSnowflakePassword('');
+    setSnowflakeDatabase('');
+    setSnowflakeWarehouse('');
+    setSnowflakeRole('');
+    setS3Bucket('');
+    setS3AccessKeyId('');
+    setS3SecretAccessKey('');
+    setS3Region('');
+    setS3EndpointUrl('');
+    setAzureBlobContainer('');
+    setAzureBlobAccountName('');
+    setAzureBlobAccountKey('');
+    setBigqueryServiceAccountJson('');
+    setBigqueryLocation('');
     setBaseUrl('');
     setAuthHeaderRows([{ key: '', value: '' }]);
     setApiMethod('GET');
@@ -354,6 +446,36 @@ export default function ConnectionProfiles({ actorId }: { actorId?: string }) {
       const credentials =
         sourceType === 'postgres'
           ? { host, port: Number(port) || 5432, database, username, password, ...(schema.trim() ? { schema: schema.trim() } : {}) }
+          : sourceType === 'azure_sql'
+          ? { host: azureSqlHost, port: Number(azureSqlPort) || 1433, database: azureSqlDatabase, username: azureSqlUsername, password: azureSqlPassword, ...(azureSqlSchema.trim() ? { schema: azureSqlSchema.trim() } : {}) }
+          : sourceType === 'snowflake'
+          ? {
+              account: snowflakeAccount,
+              username: snowflakeUsername,
+              password: snowflakePassword,
+              database: snowflakeDatabase,
+              ...(snowflakeWarehouse.trim() ? { warehouse: snowflakeWarehouse.trim() } : {}),
+              ...(snowflakeRole.trim() ? { role: snowflakeRole.trim() } : {}),
+            }
+          : sourceType === 's3'
+          ? {
+              bucket: s3Bucket,
+              aws_access_key_id: s3AccessKeyId,
+              aws_secret_access_key: s3SecretAccessKey,
+              ...(s3Region.trim() ? { region: s3Region.trim() } : {}),
+              ...(s3EndpointUrl.trim() ? { endpoint_url: s3EndpointUrl.trim() } : {}),
+            }
+          : sourceType === 'azure_blob'
+          ? {
+              container: azureBlobContainer,
+              azure_storage_account_name: azureBlobAccountName,
+              azure_storage_account_key: azureBlobAccountKey,
+            }
+          : sourceType === 'bigquery'
+          ? {
+              service_account_json: bigqueryServiceAccountJson,
+              ...(bigqueryLocation.trim() ? { location: bigqueryLocation.trim() } : {}),
+            }
           : sourceType === 'redis'
           ? {
               host: redisHost,
@@ -567,6 +689,43 @@ export default function ConnectionProfiles({ actorId }: { actorId?: string }) {
         if (editPassword) creds.password = editPassword;
         if (editSchema.trim()) creds.schema = editSchema.trim();
         if (Object.keys(creds).length) body.credentials = creds;
+      } else if (profile.type === 'azure_sql') {
+        const creds: Record<string, unknown> = {};
+        if (editAzureSqlHost.trim()) creds.host = editAzureSqlHost.trim();
+        if (editAzureSqlPort.trim()) creds.port = Number(editAzureSqlPort) || undefined;
+        if (editAzureSqlDatabase.trim()) creds.database = editAzureSqlDatabase.trim();
+        if (editAzureSqlUsername.trim()) creds.username = editAzureSqlUsername.trim();
+        if (editAzureSqlPassword) creds.password = editAzureSqlPassword;
+        if (editAzureSqlSchema.trim()) creds.schema = editAzureSqlSchema.trim();
+        if (Object.keys(creds).length) body.credentials = creds;
+      } else if (profile.type === 'snowflake') {
+        const creds: Record<string, unknown> = {};
+        if (editSnowflakeAccount.trim()) creds.account = editSnowflakeAccount.trim();
+        if (editSnowflakeUsername.trim()) creds.username = editSnowflakeUsername.trim();
+        if (editSnowflakePassword) creds.password = editSnowflakePassword;
+        if (editSnowflakeDatabase.trim()) creds.database = editSnowflakeDatabase.trim();
+        if (editSnowflakeWarehouse.trim()) creds.warehouse = editSnowflakeWarehouse.trim();
+        if (editSnowflakeRole.trim()) creds.role = editSnowflakeRole.trim();
+        if (Object.keys(creds).length) body.credentials = creds;
+      } else if (profile.type === 's3') {
+        const creds: Record<string, unknown> = {};
+        if (editS3Bucket.trim()) creds.bucket = editS3Bucket.trim();
+        if (editS3AccessKeyId.trim()) creds.aws_access_key_id = editS3AccessKeyId.trim();
+        if (editS3SecretAccessKey) creds.aws_secret_access_key = editS3SecretAccessKey;
+        if (editS3Region.trim()) creds.region = editS3Region.trim();
+        if (editS3EndpointUrl.trim()) creds.endpoint_url = editS3EndpointUrl.trim();
+        if (Object.keys(creds).length) body.credentials = creds;
+      } else if (profile.type === 'azure_blob') {
+        const creds: Record<string, unknown> = {};
+        if (editAzureBlobContainer.trim()) creds.container = editAzureBlobContainer.trim();
+        if (editAzureBlobAccountName.trim()) creds.azure_storage_account_name = editAzureBlobAccountName.trim();
+        if (editAzureBlobAccountKey) creds.azure_storage_account_key = editAzureBlobAccountKey;
+        if (Object.keys(creds).length) body.credentials = creds;
+      } else if (profile.type === 'bigquery') {
+        const creds: Record<string, unknown> = {};
+        if (editBigqueryServiceAccountJson.trim()) creds.service_account_json = editBigqueryServiceAccountJson.trim();
+        if (editBigqueryLocation.trim()) creds.location = editBigqueryLocation.trim();
+        if (Object.keys(creds).length) body.credentials = creds;
       } else if (profile.type === 'redis') {
         const creds: Record<string, unknown> = {};
         if (editRedisHost.trim()) creds.host = editRedisHost.trim();
@@ -664,19 +823,42 @@ export default function ConnectionProfiles({ actorId }: { actorId?: string }) {
   return (
     <section className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-xl space-y-5">
       <div>
-        <h2 className="text-lg font-semibold flex items-center gap-2">
-          <Plug className="h-5 w-5 text-cyan-400" /> Connection profiles
-        </h2>
+        <h1 className="text-2xl font-bold tracking-tight text-slate-100 flex items-center gap-2">
+          <Plug className="h-6 w-6 text-cyan-400" /> {filterLabel ? `${filterLabel} connections` : 'Connection profiles'}
+        </h1>
         <p className="mt-1 text-xs text-slate-400">
-          Postgres, REST API, and file upload (CSV/JSON) sources are supported. Credentials are encrypted before storage and never sent to the AI - only cached schema shape is.
+          {filterType
+            ? `Manage your ${filterLabel} connection profiles. Credentials are encrypted before storage and never sent to the AI - only cached schema shape is.`
+            : 'Postgres, REST API, GraphQL, SOAP, Redis, and file upload (CSV/JSON) sources are supported. Credentials are encrypted before storage and never sent to the AI - only cached schema shape is.'}
         </p>
       </div>
 
       <form onSubmit={createProfile} className="space-y-3 rounded-lg border border-slate-800 bg-slate-950 p-4">
+        {!filterType && (
         <div className="flex gap-2">
           <button type="button" onClick={() => setSourceType('postgres')}
             className={`rounded-lg px-3 py-1.5 text-xs font-semibold ${sourceType === 'postgres' ? 'bg-cyan-600 text-white' : 'border border-slate-700 text-slate-400 hover:bg-slate-800'}`}>
             Postgres
+          </button>
+          <button type="button" onClick={() => setSourceType('azure_sql')}
+            className={`rounded-lg px-3 py-1.5 text-xs font-semibold ${sourceType === 'azure_sql' ? 'bg-cyan-600 text-white' : 'border border-slate-700 text-slate-400 hover:bg-slate-800'}`}>
+            Azure SQL
+          </button>
+          <button type="button" onClick={() => setSourceType('snowflake')}
+            className={`rounded-lg px-3 py-1.5 text-xs font-semibold ${sourceType === 'snowflake' ? 'bg-cyan-600 text-white' : 'border border-slate-700 text-slate-400 hover:bg-slate-800'}`}>
+            Snowflake
+          </button>
+          <button type="button" onClick={() => setSourceType('s3')}
+            className={`rounded-lg px-3 py-1.5 text-xs font-semibold ${sourceType === 's3' ? 'bg-cyan-600 text-white' : 'border border-slate-700 text-slate-400 hover:bg-slate-800'}`}>
+            S3 / MinIO
+          </button>
+          <button type="button" onClick={() => setSourceType('azure_blob')}
+            className={`rounded-lg px-3 py-1.5 text-xs font-semibold ${sourceType === 'azure_blob' ? 'bg-cyan-600 text-white' : 'border border-slate-700 text-slate-400 hover:bg-slate-800'}`}>
+            Azure Blob Storage
+          </button>
+          <button type="button" onClick={() => setSourceType('bigquery')}
+            className={`rounded-lg px-3 py-1.5 text-xs font-semibold ${sourceType === 'bigquery' ? 'bg-cyan-600 text-white' : 'border border-slate-700 text-slate-400 hover:bg-slate-800'}`}>
+            BigQuery
           </button>
           <button type="button" onClick={() => setSourceType('api')}
             className={`rounded-lg px-3 py-1.5 text-xs font-semibold ${sourceType === 'api' ? 'bg-cyan-600 text-white' : 'border border-slate-700 text-slate-400 hover:bg-slate-800'}`}>
@@ -699,6 +881,7 @@ export default function ConnectionProfiles({ actorId }: { actorId?: string }) {
             SOAP
           </button>
         </div>
+        )}
 
         <div className="grid gap-3 md:grid-cols-3">
           <input required value={name} onChange={(e) => setName(e.target.value)} placeholder="Profile name (e.g. source)"
@@ -717,6 +900,68 @@ export default function ConnectionProfiles({ actorId }: { actorId?: string }) {
               <input required type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Password"
                 className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
               <input value={schema} onChange={(e) => setSchema(e.target.value)} placeholder="Schema (default: public)"
+                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+            </>
+          ) : sourceType === 'azure_sql' ? (
+            <>
+              <input required value={azureSqlHost} onChange={(e) => setAzureSqlHost(e.target.value)} placeholder="Server (e.g. myserver.database.windows.net)"
+                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+              <input required value={azureSqlPort} onChange={(e) => setAzureSqlPort(e.target.value)} placeholder="Port" inputMode="numeric"
+                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+              <input required value={azureSqlDatabase} onChange={(e) => setAzureSqlDatabase(e.target.value)} placeholder="Database name"
+                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+              <input required value={azureSqlUsername} onChange={(e) => setAzureSqlUsername(e.target.value)} placeholder="Username"
+                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+              <input required type="password" value={azureSqlPassword} onChange={(e) => setAzureSqlPassword(e.target.value)} placeholder="Password"
+                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+              <input value={azureSqlSchema} onChange={(e) => setAzureSqlSchema(e.target.value)} placeholder="Schema (default: dbo)"
+                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+            </>
+          ) : sourceType === 'snowflake' ? (
+            <>
+              <input required value={snowflakeAccount} onChange={(e) => setSnowflakeAccount(e.target.value)} placeholder="Account identifier (e.g. kgiotue-wn98412)"
+                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+              <input required value={snowflakeDatabase} onChange={(e) => setSnowflakeDatabase(e.target.value)} placeholder="Database name"
+                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+              <input required value={snowflakeUsername} onChange={(e) => setSnowflakeUsername(e.target.value)} placeholder="Username"
+                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+              <input required type="password" value={snowflakePassword} onChange={(e) => setSnowflakePassword(e.target.value)} placeholder="Password"
+                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+              <input value={snowflakeWarehouse} onChange={(e) => setSnowflakeWarehouse(e.target.value)} placeholder="Warehouse (optional)"
+                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+              <input value={snowflakeRole} onChange={(e) => setSnowflakeRole(e.target.value)} placeholder="Role (optional)"
+                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+            </>
+          ) : sourceType === 's3' ? (
+            <>
+              <input required value={s3Bucket} onChange={(e) => setS3Bucket(e.target.value)} placeholder="Bucket name"
+                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+              <input required value={s3AccessKeyId} onChange={(e) => setS3AccessKeyId(e.target.value)} placeholder="Access key ID"
+                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+              <input required type="password" value={s3SecretAccessKey} onChange={(e) => setS3SecretAccessKey(e.target.value)} placeholder="Secret access key"
+                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+              <input value={s3Region} onChange={(e) => setS3Region(e.target.value)} placeholder="Region (optional)"
+                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+              <input value={s3EndpointUrl} onChange={(e) => setS3EndpointUrl(e.target.value)} placeholder="Endpoint URL (for MinIO or other S3-compatible services)"
+                className="md:col-span-2 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+            </>
+          ) : sourceType === 'azure_blob' ? (
+            <>
+              <input required value={azureBlobContainer} onChange={(e) => setAzureBlobContainer(e.target.value)} placeholder="Container name"
+                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+              <input required value={azureBlobAccountName} onChange={(e) => setAzureBlobAccountName(e.target.value)} placeholder="Storage account name"
+                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+              <input required type="password" value={azureBlobAccountKey} onChange={(e) => setAzureBlobAccountKey(e.target.value)} placeholder="Storage account key"
+                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+            </>
+          ) : sourceType === 'bigquery' ? (
+            <>
+              <div className="md:col-span-3 space-y-1">
+                <p className="text-[11px] text-slate-400">Service account key (paste the whole downloaded JSON file)</p>
+                <textarea required value={bigqueryServiceAccountJson} onChange={(e) => setBigqueryServiceAccountJson(e.target.value)} placeholder='{"type": "service_account", "project_id": "...", "private_key": "...", "client_email": "...", ...}'
+                  className="h-32 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 font-mono text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+              </div>
+              <input value={bigqueryLocation} onChange={(e) => setBigqueryLocation(e.target.value)} placeholder="Location (default: US)"
                 className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
             </>
           ) : sourceType === 'api' ? (
@@ -1029,10 +1274,12 @@ export default function ConnectionProfiles({ actorId }: { actorId?: string }) {
       )}
 
       <div className="space-y-2">
-        {profiles.length === 0 ? (
+        {(() => {
+          const visibleProfiles = filterType ? profiles.filter((p) => p.type === filterType) : profiles;
+          return visibleProfiles.length === 0 ? (
           <p className="text-xs text-slate-500">No connection profiles yet.</p>
         ) : (
-          profiles.map((profile) => (
+          visibleProfiles.map((profile) => (
             <div key={profile.id} className="rounded-lg border border-slate-800 bg-slate-950 p-3">
               <div className="flex items-center justify-between gap-3">
                 <div className="min-w-0">
@@ -1100,6 +1347,65 @@ export default function ConnectionProfiles({ actorId }: { actorId?: string }) {
                         className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
                       <input value={editSchema} onChange={(e) => setEditSchema(e.target.value)} placeholder="New schema (optional)"
                         className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+                    </div>
+                  ) : profile.type === 'azure_sql' ? (
+                    <div className="grid gap-2 md:grid-cols-3">
+                      <input value={editAzureSqlHost} onChange={(e) => setEditAzureSqlHost(e.target.value)} placeholder="New server (optional)"
+                        className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+                      <input value={editAzureSqlPort} onChange={(e) => setEditAzureSqlPort(e.target.value)} placeholder="New port (optional)" inputMode="numeric"
+                        className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+                      <input value={editAzureSqlDatabase} onChange={(e) => setEditAzureSqlDatabase(e.target.value)} placeholder="New database (optional)"
+                        className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+                      <input value={editAzureSqlUsername} onChange={(e) => setEditAzureSqlUsername(e.target.value)} placeholder="New username (optional)"
+                        className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+                      <input type="password" value={editAzureSqlPassword} onChange={(e) => setEditAzureSqlPassword(e.target.value)} placeholder="New password (optional)"
+                        className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+                      <input value={editAzureSqlSchema} onChange={(e) => setEditAzureSqlSchema(e.target.value)} placeholder="New schema (optional)"
+                        className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+                    </div>
+                  ) : profile.type === 'snowflake' ? (
+                    <div className="grid gap-2 md:grid-cols-3">
+                      <input value={editSnowflakeAccount} onChange={(e) => setEditSnowflakeAccount(e.target.value)} placeholder="New account identifier (optional)"
+                        className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+                      <input value={editSnowflakeDatabase} onChange={(e) => setEditSnowflakeDatabase(e.target.value)} placeholder="New database (optional)"
+                        className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+                      <input value={editSnowflakeUsername} onChange={(e) => setEditSnowflakeUsername(e.target.value)} placeholder="New username (optional)"
+                        className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+                      <input type="password" value={editSnowflakePassword} onChange={(e) => setEditSnowflakePassword(e.target.value)} placeholder="New password (optional)"
+                        className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+                      <input value={editSnowflakeWarehouse} onChange={(e) => setEditSnowflakeWarehouse(e.target.value)} placeholder="New warehouse (optional)"
+                        className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+                      <input value={editSnowflakeRole} onChange={(e) => setEditSnowflakeRole(e.target.value)} placeholder="New role (optional)"
+                        className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+                    </div>
+                  ) : profile.type === 's3' ? (
+                    <div className="grid gap-2 md:grid-cols-3">
+                      <input value={editS3Bucket} onChange={(e) => setEditS3Bucket(e.target.value)} placeholder="New bucket (optional)"
+                        className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+                      <input value={editS3AccessKeyId} onChange={(e) => setEditS3AccessKeyId(e.target.value)} placeholder="New access key ID (optional)"
+                        className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+                      <input type="password" value={editS3SecretAccessKey} onChange={(e) => setEditS3SecretAccessKey(e.target.value)} placeholder="New secret access key (optional)"
+                        className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+                      <input value={editS3Region} onChange={(e) => setEditS3Region(e.target.value)} placeholder="New region (optional)"
+                        className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+                      <input value={editS3EndpointUrl} onChange={(e) => setEditS3EndpointUrl(e.target.value)} placeholder="New endpoint URL (optional)"
+                        className="md:col-span-2 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+                    </div>
+                  ) : profile.type === 'azure_blob' ? (
+                    <div className="grid gap-2 md:grid-cols-3">
+                      <input value={editAzureBlobContainer} onChange={(e) => setEditAzureBlobContainer(e.target.value)} placeholder="New container (optional)"
+                        className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+                      <input value={editAzureBlobAccountName} onChange={(e) => setEditAzureBlobAccountName(e.target.value)} placeholder="New account name (optional)"
+                        className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+                      <input type="password" value={editAzureBlobAccountKey} onChange={(e) => setEditAzureBlobAccountKey(e.target.value)} placeholder="New account key (optional)"
+                        className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+                    </div>
+                  ) : profile.type === 'bigquery' ? (
+                    <div className="space-y-2">
+                      <textarea value={editBigqueryServiceAccountJson} onChange={(e) => setEditBigqueryServiceAccountJson(e.target.value)} placeholder="New service account key JSON (optional)"
+                        className="h-28 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 font-mono text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+                      <input value={editBigqueryLocation} onChange={(e) => setEditBigqueryLocation(e.target.value)} placeholder="New location (optional)"
+                        className="w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
                     </div>
                   ) : profile.type === 'redis' ? (
                     <div className="grid gap-2 md:grid-cols-3">
@@ -1430,7 +1736,8 @@ export default function ConnectionProfiles({ actorId }: { actorId?: string }) {
               )}
             </div>
           ))
-        )}
+        );
+        })()}
       </div>
     </section>
   );
