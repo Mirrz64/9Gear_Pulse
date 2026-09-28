@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import docker
 import anthropic
@@ -7,8 +8,23 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 
 from introspect import get_db_url
+from ai_provider import stream_structured_message
+from model_config import get_model_for_stage, get_thinking_kwargs_for_stage, PipelineStage
 
 load_dotenv(override=False)
+
+# Sandbox resource limits - configurable via env var, sensible defaults
+# otherwise. Genuinely needed once more than one person's generated
+# pipelines can run at the same time: with no limits at all, one
+# runaway or hung container (an infinite loop, a network call that
+# never returns) can consume unbounded host resources, or - with no
+# timeout on container.wait() at all - block a Celery worker slot
+# indefinitely, starving out everyone else's queued work, not just
+# slowing down whoever caused it. Placed after load_dotenv() runs, not
+# before, so a value set in a .env file is actually visible here.
+SANDBOX_MEM_LIMIT = os.environ.get("SANDBOX_MEM_LIMIT", "1g")
+SANDBOX_NANO_CPUS = int(os.environ.get("SANDBOX_NANO_CPUS", 1_000_000_000))  # 1 full CPU
+SANDBOX_TIMEOUT_SECONDS = int(os.environ.get("SANDBOX_TIMEOUT_SECONDS", 300))
 
 # Initialize clients if keys exist in environment
 anthropic_key = os.getenv("ANTHROPIC_API_KEY")
@@ -25,7 +41,7 @@ class HealedPipeline(BaseModel):
 
 
 HEALER_SYSTEM_PROMPT = """You are an expert Python data engineering agent specializing in `dlt` and data pipelines.
-You are given a broken Python ETL script, schema metadata of the source, and the runtime error/traceback produced when executing it inside a Docker container.
+You are given a broken Python ETL script, schema metadata of the source, and the runtime error/traceback produced when executing it inside a Docker container - as both the full raw error_traceback and a best-effort error_summary (exception_type, exception_message, failing_file, failing_line, failing_function where these were reliably extractable). error_summary is a quick, deterministic anchor, not a replacement for reading error_traceback yourself - it's regex-extracted, not reasoned about, so it can be incomplete or absent for an error shape it doesn't recognize (in which case its fields are simply missing; that is not itself informative, just means the raw traceback is your only source there). Always read the full error_traceback for real understanding; treat error_summary as a fast starting pointer to where in the code to look, nothing more.
 
 Your job is to fix the code so that it executes without errors.
 - Preserve the overall pipeline logic and business goal.
@@ -186,7 +202,7 @@ def run_in_sandbox(script_path: str, source_db_url: str = None, dest_db_url: str
 
     setup_and_run_cmd = (
         '/bin/bash -c "pip install --quiet --disable-pip-version-check --no-warn-script-location '
-        'dlt[snowflake,filesystem,az,bigquery] psycopg2-binary pymssql sqlalchemy requests redis && python /app/pipeline.py"'
+        'dlt[snowflake,filesystem,az,bigquery] psycopg2-binary pymssql snowflake-sqlalchemy sqlalchemy requests redis && python /app/pipeline.py"'
     )
 
     try:
@@ -201,10 +217,24 @@ def run_in_sandbox(script_path: str, source_db_url: str = None, dest_db_url: str
             volumes=volumes,
             environment=env_vars,
             extra_hosts={"host.docker.internal": "host-gateway"},
-            detach=True
+            detach=True,
+            mem_limit=SANDBOX_MEM_LIMIT,
+            nano_cpus=SANDBOX_NANO_CPUS,
         )
 
-        result = container.wait()
+        try:
+            result = container.wait(timeout=SANDBOX_TIMEOUT_SECONDS)
+        except Exception:
+            # The timeout only stops *waiting* - the container itself is
+            # still running and still consuming host resources unless
+            # explicitly stopped here. force=True since a genuinely hung
+            # process may not respond to a graceful stop in time.
+            try:
+                container.remove(force=True)
+            except Exception:
+                pass
+            return (False, f"Sandbox execution exceeded the {SANDBOX_TIMEOUT_SECONDS}s timeout and was stopped - likely an infinite loop or a network call that never returns.")
+
         logs = container.logs().decode('utf-8')
         container.remove()
 
@@ -213,24 +243,105 @@ def run_in_sandbox(script_path: str, source_db_url: str = None, dest_db_url: str
         return (False, f"Sandbox runtime container exception: {str(e)}")
 
 
-def heal_script(broken_code: str, error_log: str, schema_summary: dict = None) -> str:
-    """Attempts code repair using Anthropic Claude first, falling back to OpenAI GPT-4o on error."""
+def _parse_error_traceback(error_log: str) -> dict:
+    """Best-effort structured extraction from a raw Python traceback -
+    exception type, its message, and the deepest stack frame's file and
+    line number. Regex-based, not AI-based - a genuinely different,
+    deterministic mechanism from the healer's own reasoning over the
+    raw error, not a duplicate of it. Gives heal_script() a quick,
+    reliable anchor before it reasons over the full text, which is
+    still passed through completely unchanged alongside this - this
+    only ever supplements the raw traceback, never replaces it.
+
+    Best-effort by design: a traceback shape this doesn't recognize
+    (e.g. a non-Python failure surfaced some other way) just returns
+    an empty dict, and heal_script() falls back to the raw error_log
+    alone, exactly as it always has.
+    """
+    result: dict = {}
+    if not error_log:
+        return result
+
+    lines = [line for line in error_log.strip().splitlines() if line.strip()]
+    if not lines:
+        return result
+
+    # A standard Python traceback's last line is "ExceptionType: message"
+    # - the deepest, most specific signal in the whole trace. Matched by
+    # dotted-identifier shape (KeyError, psycopg2.errors.UndefinedColumn,
+    # snowflake.connector.errors.ProgrammingError), not by a name suffix -
+    # real exception class names don't follow one universal naming
+    # convention (UndefinedColumn has no "Error"/"Exception" suffix at
+    # all), confirmed directly by testing against it and catching this
+    # exact miss before it shipped. Some exceptions (e.g. bare SystemExit)
+    # have no colon-separated message.
+    last_line = lines[-1]
+    with_message = re.match(r'^(\w+(?:\.\w+)*):\s*(.+)$', last_line)
+    if with_message:
+        result["exception_type"] = with_message.group(1)
+        result["exception_message"] = with_message.group(2).strip()
+    else:
+        bare = re.match(r'^(\w+(?:\.\w+)*)\s*$', last_line)
+        if bare:
+            result["exception_type"] = bare.group(1)
+
+    # The deepest "File ..., line N, in ..." frame - the actual failure
+    # site, not the outermost call that eventually led to it.
+    frames = re.findall(r'File "([^"]+)", line (\d+)(?:, in (\S+))?', error_log)
+    if frames:
+        failing_file, failing_line, failing_function = frames[-1]
+        result["failing_file"] = failing_file
+        result["failing_line"] = int(failing_line)
+        if failing_function:
+            result["failing_function"] = failing_function
+
+    return result
+
+
+def heal_script(broken_code: str, error_log: str, schema_summary: dict = None, healing_attempt: int = 1, meta: dict = None) -> str:
+    """Attempts code repair using Anthropic Claude first, falling back to OpenAI GPT-4o on error.
+
+    healing_attempt is which healing call this is within the outer
+    retry loop (1 on the first failed sandbox run, 2 on the second,
+    etc.) - not a failure classification. The first attempt uses
+    Sonnet; if that fix didn't actually resolve it, every subsequent
+    attempt escalates to Opus and stays there.
+
+    meta, when given, is filled in-place with what this call alone
+    knows and the return value can't carry: which provider and model
+    actually answered (Anthropic, or the OpenAI fallback), and the
+    healer's own root_cause and changes_made - both of which this
+    function used to compute and then throw away, returning only the
+    code. Optional and additive: callers that don't pass it behave
+    exactly as before.
+    """
 
     # default=str handles datetime/non-serializable objects cleanly
     user_prompt = json.dumps({
         "broken_code": broken_code,
         "error_traceback": error_log,
+        "error_summary": _parse_error_traceback(error_log),
         "schema_summary": schema_summary or {}
     }, default=str)
 
-    # Primary Attempt: Anthropic Claude Sonnet 5, via native structured outputs.
+    # Primary Attempt: Anthropic Claude, via native structured outputs.
     if anthropic_client:
         try:
-            print("[Self-Healer] Contacting Primary AI Provider: Anthropic (Claude Sonnet 5)...")
-            response = anthropic_client.messages.parse(
-                model="claude-sonnet-5",
-                max_tokens=16000,
-                thinking={"type": "disabled"},
+            stage = PipelineStage.SELF_HEALING_FIRST_ATTEMPT if healing_attempt <= 1 else PipelineStage.SELF_HEALING_ESCALATED
+            model_id = get_model_for_stage(stage)
+            thinking_kwargs = get_thinking_kwargs_for_stage(stage)
+            print(f"[Self-Healer] Contacting Primary AI Provider: Anthropic ({model_id}) - healing attempt {healing_attempt}...")
+            # Same reasoning as propose_architecture.py's own fix -
+            # adaptive thinking (only ever in play once escalated to
+            # Opus) shares this budget with the visible response, so it
+            # needs a larger ceiling than the disabled-thinking case
+            # this 16000 was originally sized for.
+            max_tokens = 64000 if thinking_kwargs["thinking"]["type"] == "adaptive" else 16000
+            response = stream_structured_message(
+                anthropic_client,
+                model=model_id,
+                max_tokens=max_tokens,
+                **thinking_kwargs,
                 system=HEALER_SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": user_prompt}],
                 output_format=HealedPipeline,
@@ -243,10 +354,14 @@ def heal_script(broken_code: str, error_log: str, schema_summary: dict = None) -
                 )
             print(f"[Healer Diagnosis (Anthropic)]: {parsed.root_cause}")
             print(f"[Changes Applied]: {parsed.changes_made}\n")
+            if meta is not None:
+                meta.update(provider="anthropic", model=model_id, root_cause=parsed.root_cause, changes_made=parsed.changes_made)
             return parsed.fixed_code
 
         except Exception as e:
             print(f"[Warning] Anthropic API failed or encountered error: {e}")
+            if meta is not None:
+                meta["detail"] = f"Anthropic failed, fell back to OpenAI: {e}"
             print("[Self-Healer] Switching over to Fallback AI Provider: OpenAI (GPT-4o)...")
 
     # Fallback Attempt: OpenAI GPT-4o, via its own native structured outputs.
@@ -268,6 +383,8 @@ def heal_script(broken_code: str, error_log: str, schema_summary: dict = None) -
                 )
             print(f"[Healer Diagnosis (OpenAI Fallback)]: {parsed.root_cause}")
             print(f"[Changes Applied]: {parsed.changes_made}\n")
+            if meta is not None:
+                meta.update(provider="openai", model="gpt-4o", root_cause=parsed.root_cause, changes_made=parsed.changes_made)
             return parsed.fixed_code
 
         except Exception as e:
@@ -286,6 +403,7 @@ def execute_with_self_healing(
     needs_source_db: bool = True,
     source_files_dir: str = None,
     needs_dest_db: bool = True,
+    healing_recorder=None,
 ) -> tuple[bool, int, str, str]:
     """Executes script in sandbox and auto-repairs on failure up to max_retries.
 
@@ -297,6 +415,14 @@ def execute_with_self_healing(
     instead of this return value silently saves the pre-heal attempt
     while the logs describe a later, different, healed version -
     exactly the gap this return value exists to close.
+
+    healing_recorder, when given, is called once per healing attempt
+    with a dict describing it (error, the AI's diagnosis, code before
+    and after, and - resolved by the NEXT sandbox run, since a fix
+    can't be judged until it has actually been run - its outcome).
+    Purely additive: it never changes what this function does or
+    returns, and a recorder that raises is ignored rather than
+    allowed to break healing itself. Feeds the self-healing ledger.
     """
     if schema_summary is None:
         from introspect import introspect_schema
@@ -306,13 +432,37 @@ def execute_with_self_healing(
         with open(script_path, "r", encoding="utf-8") as f:
             return f.read()
 
+    def _emit(event: dict) -> None:
+        if healing_recorder is None:
+            return
+        try:
+            healing_recorder(event)
+        except Exception as exc:
+            print(f"[Healing Ledger] recorder failed (ignored): {exc}")
+
     last_logs = ""
+    pending_event = None
     for attempt in range(1, max_retries + 1):
         print(f"--- Sandbox Run (Attempt {attempt}/{max_retries}) ---")
         success, logs = run_in_sandbox(
             script_path, source_db_url, dest_db_url, extra_env, needs_source_db, source_files_dir, needs_dest_db,
         )
         last_logs = logs
+
+        # This run is the verdict on the PREVIOUS attempt's fix.
+        if pending_event is not None:
+            pending_event["outcome"] = "fixed" if success else "still_failing"
+            if not success:
+                previous = pending_event.get("error_summary") or {}
+                current = _parse_error_traceback(logs)
+                # None (unknown) when either error couldn't be parsed,
+                # rather than guessing.
+                pending_event["same_error"] = (
+                    (previous.get("exception_type"), previous.get("exception_message"))
+                    == (current.get("exception_type"), current.get("exception_message"))
+                ) if previous and current else None
+            _emit(pending_event)
+            pending_event = None
 
         if success:
             print("\nPipeline execution succeeded!")
@@ -328,7 +478,19 @@ def execute_with_self_healing(
             with open(script_path, "r", encoding="utf-8") as f:
                 broken_code = f.read()
 
-            fixed_code = heal_script(broken_code, logs, schema_summary)
+            meta: dict = {}
+            event = {
+                "trigger": "execution_error", "attempt_number": attempt, "error_log": logs,
+                "error_summary": _parse_error_traceback(logs), "code_before": broken_code,
+            }
+            try:
+                fixed_code = heal_script(broken_code, logs, schema_summary, healing_attempt=attempt, meta=meta)
+            except Exception as exc:
+                _emit({**event, **meta, "outcome": "heal_call_failed", "detail": str(exc)})
+                raise
+            event.update(meta)
+            event["code_after"] = fixed_code
+            pending_event = event
 
             with open(script_path, "w", encoding="utf-8") as f:
                 f.write(fixed_code)

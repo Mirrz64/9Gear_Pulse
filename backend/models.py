@@ -610,6 +610,71 @@ class PipelineRun(Base):
     pipeline_version_file: Mapped[Optional["PipelineVersionFile"]] = relationship(back_populates="runs")
 
 
+class HealingEvent(Base):
+    """One self-healing attempt: what broke, what the AI diagnosed and
+    changed, and - once the next run finished - whether it actually
+    worked. Append-only. Exists because every healing attempt used to be
+    discarded the moment it completed (only the final code survived),
+    which threw away exactly the data needed to measure self-healing
+    quality, and to train a smaller model on routine fixes later - data
+    that can't be regenerated after the fact.
+
+    trigger/outcome are plain strings, not Postgres enums: these
+    vocabularies will grow as healing does, and a new value shouldn't
+    need an ALTER TYPE migration each time (see the enum pitfalls
+    already documented elsewhere in this project).
+
+    trigger:  execution_error | quality_warning
+    outcome:  fixed | still_failing | broke_execution | warnings_persist
+              | heal_call_failed | recheck_failed
+    """
+
+    __tablename__ = "healing_events"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    # CASCADE, not left dangling: deleting a project or pipeline deletes
+    # its ledger rows too. These rows can contain fragments of a user's
+    # own schema or error output, so they must not outlive the data
+    # they came from.
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    pipeline_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("pipelines.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    pipeline_version_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("pipeline_versions.id", ondelete="SET NULL"), nullable=True
+    )
+    pipeline_version_file_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("pipeline_version_files.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    trigger: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Which healing call this was within one run's retry loop (1 = the
+    # first, Sonnet by default; 2+ = escalated to Opus).
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    outcome: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    provider: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    model: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    source_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    destination_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+
+    exception_type: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    error_summary: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    error_log: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    code_before: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    code_after: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    root_cause: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    changes_made: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # After a failed fix: did the NEXT run fail with the same error
+    # (the fix changed nothing that mattered) or a different one
+    # (progress, or a new problem)? Null when not applicable.
+    same_error: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
 class PipelineReview(Base):
     """Append-only record of a human approval or rejection."""
 
