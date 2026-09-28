@@ -34,7 +34,9 @@ from typing import List, Optional
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 import anthropic
-from ai_provider import call_with_rate_limit_backoff
+from ai_provider import call_with_rate_limit_backoff, stream_structured_message
+from model_config import get_model_for_stage, get_thinking_kwargs_for_stage, PipelineStage
+from vetted_patterns import patterns_for_architecture_review
 import openai
 
 load_dotenv(override=False)
@@ -185,6 +187,17 @@ pattern the approach follows explicitly, and when it's "incremental", the \
 build plan should make clear what key or watermark column the merge is \
 based on, if the schema makes that determinable.
 
+A small set of vetted, well-understood patterns follows - recognize and \
+name one explicitly in key_transformations or approach when a step \
+genuinely matches, so code generation downstream knows to apply the \
+correct, proven implementation rather than reinventing it from scratch. \
+This is guidance to reach for when it fits, never a closed list a step \
+must be forced into - a goal that doesn't match any of these is still \
+handled by describing whatever custom logic it actually needs, exactly as \
+before this list existed.
+
+""" + patterns_for_architecture_review() + """
+
 If feasible, describe the intended approach in plain language: which real \
 tables you'll read (source_tables_used - actual names from schema_summary, \
 never names you're introducing), what transformation logic will happen \
@@ -314,11 +327,22 @@ def propose_architecture(
 
     if anthropic_client:
         try:
-            print("[Architect] Contacting Primary AI Provider: Anthropic (Claude Sonnet 5)...")
-            response = call_with_rate_limit_backoff(lambda: anthropic_client.messages.parse(
-                model="claude-sonnet-5",
-                max_tokens=16000,
-                thinking={"type": "disabled"},
+            model_id = get_model_for_stage(PipelineStage.ARCHITECTURE_REVIEW)
+            thinking_kwargs = get_thinking_kwargs_for_stage(PipelineStage.ARCHITECTURE_REVIEW)
+            print(f"[Architect] Contacting Primary AI Provider: Anthropic ({model_id})...")
+            # Adaptive thinking shares this budget with the visible
+            # response - the original 16000 was sized for "no reasoning
+            # tokens at all" and stays correct for Sonnet, which never
+            # reasons here. Anthropic's own guidance for higher-effort
+            # adaptive thinking is to start at 64000, to avoid the
+            # response truncating mid-answer once thinking actually
+            # consumes part of the shared budget.
+            max_tokens = 64000 if thinking_kwargs["thinking"]["type"] == "adaptive" else 16000
+            response = call_with_rate_limit_backoff(lambda: stream_structured_message(
+                anthropic_client,
+                model=model_id,
+                max_tokens=max_tokens,
+                **thinking_kwargs,
                 system=SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": user_content}],
                 output_format=ArchitectureProposal,
