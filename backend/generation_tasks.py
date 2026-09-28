@@ -50,7 +50,8 @@ import sqlalchemy as sa
 
 from audit import _audit
 from celery_app import celery_app
-from connection_service import CredentialResolutionError, api_credentials, azure_blob_credentials, azure_sql_url, bigquery_credentials, file_credentials, graphql_credentials, postgres_url, redis_url, s3_credentials, snowflake_credentials, soap_credentials
+from healing_ledger import record_healing_events
+from connection_service import CredentialResolutionError, api_credentials, azure_blob_credentials, azure_sql_url, bigquery_credentials, decrypt_credentials, file_credentials, graphql_credentials, postgres_url, redis_url, s3_credentials, snowflake_credentials, snowflake_url, soap_credentials
 from introspect import introspect_schema
 from models import (
     ConnectionType,
@@ -65,6 +66,121 @@ from models import (
     RunStatus,
 )
 from session import SessionLocal
+
+
+def _attempt_quality_driven_heal(
+    quality_result: dict | None,
+    current_code: str,
+    schema_summary: dict,
+    destination_url: str,
+    quality_schema: str,
+    quality_table: str,
+    source_db_url: str = None,
+    extra_env: dict = None,
+    needs_source_db: bool = True,
+    source_files_dir: str = None,
+    needs_dest_db: bool = True,
+    healing_recorder=None,
+) -> tuple[str, dict | None, int | None]:
+    """When a pipeline executed successfully but its own data-quality
+    check came back with real warnings, tries ONE additional heal pass
+    using those warnings as the "error" - the existing crash-driven
+    retry loop in execute_with_self_healing() never sees this class of
+    problem at all, since the code didn't crash, it just produced
+    wrong or incomplete data.
+
+    Re-tests the result the same way the crash-driven loop already
+    does - never trusting a fix without re-running it - and only
+    adopts the quality-driven fix if it (a) still executes successfully
+    and (b) actually clears the warnings that triggered this, not just
+    changes them. A working pipeline with a known, visible quality
+    warning is safer to hand to a human reviewer than one "fixed" into
+    a state that's silently broken in some other way while chasing the
+    original warning - so any failure at any step here just falls back
+    to the original, already-working, already-quality-checked inputs,
+    unchanged.
+
+    Returns (code_to_use, quality_result_to_use, row_count_to_use).
+    """
+    if not quality_result or not quality_result.get("checked") or not quality_result.get("warnings"):
+        return current_code, quality_result, (quality_result.get("row_count") if quality_result else None)
+
+    from heal_pipeline import heal_script, execute_with_self_healing
+    from data_quality import run_quality_checks
+
+    warning_lines = "\n".join(f"- {w}" for w in quality_result["warnings"])
+    quality_error_context = (
+        "This pipeline executed without raising any exception, but its own "
+        "post-run data quality check flagged real problems with the data it "
+        "actually wrote:\n" + warning_lines +
+        "\n\nThe code runs, but something in its logic is producing incorrect "
+        "or incomplete output - fix the actual cause (e.g. a silently-empty "
+        "column, a wrong join, a filter dropping rows it shouldn't), not just "
+        "the symptom."
+    )
+
+    fallback = (current_code, quality_result, quality_result.get("row_count"))
+
+    meta: dict = {}
+    event = {
+        "trigger": "quality_warning", "attempt_number": 1,
+        "error_log": quality_error_context, "error_summary": None,
+        "code_before": current_code,
+    }
+
+    def _record(outcome: str, **extra) -> None:
+        # Feeds the self-healing ledger. Never allowed to break the heal
+        # itself - same rule the crash-driven loop's recorder follows.
+        if healing_recorder is None:
+            return
+        try:
+            healing_recorder({**event, **meta, **extra, "outcome": outcome})
+        except Exception as exc:
+            print(f"[Healing Ledger] recorder failed (ignored): {exc}")
+
+    try:
+        fixed_code = heal_script(current_code, quality_error_context, schema_summary, healing_attempt=1, meta=meta)
+    except Exception as exc:
+        _record("heal_call_failed", detail=str(exc))
+        return fallback
+    event["code_after"] = fixed_code
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", encoding="utf-8", delete=False) as script:
+        script.write(fixed_code)
+        retest_path = script.name
+    try:
+        # max_retries=1 deliberately - this is a single verification
+        # pass confirming the quality-driven fix still runs at all, not
+        # a second full healing cycle stacked on top of the first.
+        retest_success, _, _, retested_code = execute_with_self_healing(
+            retest_path, schema_summary, 1, source_db_url, destination_url,
+            extra_env=extra_env, needs_source_db=needs_source_db,
+            source_files_dir=source_files_dir, needs_dest_db=needs_dest_db,
+        )
+    finally:
+        os.unlink(retest_path)
+
+    if not retest_success:
+        _record("broke_execution")
+        return fallback
+
+    try:
+        new_quality_result = run_quality_checks(destination_url, quality_schema, quality_table)
+    except Exception as exc:
+        # The fix ran, but there's no verdict on it - excluded from the
+        # ledger's fix-rate math for exactly that reason.
+        _record("recheck_failed", detail=str(exc))
+        return fallback
+
+    if new_quality_result.get("warnings"):
+        # Still has warnings after a genuine attempt - keep the
+        # original, human-reviewable version rather than swap in a
+        # "fix" that didn't actually resolve what it targeted.
+        _record("warnings_persist")
+        return fallback
+
+    _record("fixed")
+    return retested_code, new_quality_result, new_quality_result.get("row_count")
 
 
 def _split_destination_table(dataset: str, destination_table: str) -> tuple[str, str]:
@@ -167,12 +283,59 @@ def _resolve_source_execution_params(source):
         # of any one file's storage_path is that shared directory.
         files_dir = os.path.dirname(files[0]["storage_path"])
         return None, None, False, files_dir
+    if source.type == ConnectionType.s3:
+        # Unlike the file source above, there's no local directory to
+        # mount - the data lives in a remote bucket, so the generated
+        # code (via dlt's native filesystem SOURCE, the same dlt[filesystem]
+        # extra already installed in the sandbox for the destination side)
+        # connects over the network at runtime, using credentials passed
+        # as env vars - the same shape as api/redis/graphql above, not
+        # the file source's mounted-directory approach.
+        creds = s3_credentials(source)
+        env = {
+            "SOURCE_S3_BUCKET_URL": creds["bucket_url"],
+            "SOURCE_S3_ACCESS_KEY_ID": creds["aws_access_key_id"],
+            "SOURCE_S3_SECRET_ACCESS_KEY": creds["aws_secret_access_key"],
+        }
+        if "region_name" in creds:
+            env["SOURCE_S3_REGION"] = creds["region_name"]
+        if "endpoint_url" in creds:
+            # What makes this work against MinIO too, not just real AWS S3.
+            env["SOURCE_S3_ENDPOINT_URL"] = creds["endpoint_url"]
+        # prefix is source-specific (which objects to actually read),
+        # not part of s3_credentials() itself - that resolver is shared
+        # with the destination side, which has no such concept at all.
+        prefix = (decrypt_credentials(source).get("prefix") or "").strip()
+        if prefix:
+            env["SOURCE_S3_PREFIX"] = prefix
+        return None, env, False, None
+    if source.type == ConnectionType.azure_blob:
+        # Same reasoning as the S3 source above: no local directory to
+        # mount, so the generated code connects over the network at
+        # runtime via dlt's filesystem source, using env-var credentials.
+        creds = azure_blob_credentials(source)
+        env = {
+            "SOURCE_AZURE_BLOB_BUCKET_URL": creds["bucket_url"],
+            "SOURCE_AZURE_BLOB_ACCOUNT_NAME": creds["azure_storage_account_name"],
+            "SOURCE_AZURE_BLOB_ACCOUNT_KEY": creds["azure_storage_account_key"],
+        }
+        # prefix is source-specific and not part of azure_blob_credentials()
+        # (shared with the destination side, which has no such concept).
+        prefix = (decrypt_credentials(source).get("prefix") or "").strip()
+        if prefix:
+            env["SOURCE_AZURE_BLOB_PREFIX"] = prefix
+        return None, env, False, None
     if source.type == ConnectionType.azure_sql:
         # introspect_schema() already works here with zero changes -
         # its own docstring confirms it works via generic SQLAlchemy
         # reflection, not Postgres-specific queries, so any valid
         # SQLAlchemy connection string is enough.
         return azure_sql_url(source), None, True, None
+    if source.type == ConnectionType.snowflake:
+        # Same reasoning as azure_sql above - generic SQLAlchemy
+        # reflection via snowflake-sqlalchemy, confirmed to need no
+        # changes to introspect_schema() itself.
+        return snowflake_url(source), None, True, None
     return postgres_url(source), None, True, None
 
 
@@ -424,6 +587,10 @@ def run_pipeline_generation(pipeline_id: str, version_id: str, goal: str, max_re
 
 def _run_pipeline_generation_locked(db, pipeline, version, goal: str, max_retries: int, actor_id: uuid.UUID) -> None:
     from models import ConnectionProfile
+    # Collects every healing attempt made during this run (crash-driven
+    # and quality-driven) for the self-healing ledger; persisted just
+    # before this run's own commit, whatever way the run ended.
+    healing_events: list = []
     source = db.get(ConnectionProfile, pipeline.source_connection_id)
     destination = db.get(ConnectionProfile, pipeline.destination_connection_id)
     if source is None or destination is None:
@@ -493,7 +660,7 @@ def _run_pipeline_generation_locked(db, pipeline, version, goal: str, max_retrie
             success, attempts, logs, final_code = execute_with_self_healing(
                 script_path, source.schema_metadata_json, max_retries, source_url, destination_url,
                 extra_env=extra_env, needs_source_db=needs_source_db, source_files_dir=source_files_dir,
-                needs_dest_db=needs_dest_db,
+                needs_dest_db=needs_dest_db, healing_recorder=healing_events.append,
             )
             version.generated_code = final_code
             pipeline.generated_code = final_code
@@ -519,6 +686,16 @@ def _run_pipeline_generation_locked(db, pipeline, version, goal: str, max_retrie
             )
             quality_result = run_quality_checks(destination_url, quality_schema, quality_table)
             row_count = quality_result.get("row_count")
+
+            final_code, quality_result, row_count = _attempt_quality_driven_heal(
+                quality_result, final_code, source.schema_metadata_json,
+                destination_url, quality_schema, quality_table,
+                source_db_url=source_url, extra_env=extra_env,
+                needs_source_db=needs_source_db, source_files_dir=source_files_dir,
+                needs_dest_db=needs_dest_db, healing_recorder=healing_events.append,
+            )
+            version.generated_code = final_code
+            pipeline.generated_code = final_code
         except Exception as exc:
             quality_result = {"checked": False, "reason": f"Quality check itself failed: {exc}"}
 
@@ -527,6 +704,13 @@ def _run_pipeline_generation_locked(db, pipeline, version, goal: str, max_retrie
                       started_at=started_at, finished_at=datetime.now(timezone.utc),
                       log_output=logs if success else None, error_output=None if success else logs,
                       row_count=row_count, quality_checks=quality_result)
+    # Before db.add(run), not after: record_healing_events opens a
+    # SAVEPOINT, which flushes everything already pending first - so a
+    # ledger failure can only ever roll back ledger rows, never this run.
+    record_healing_events(
+        db, healing_events, project_id=pipeline.project_id, pipeline_id=pipeline.id,
+        version_id=version.id, file_id=None, source_type=source.type, destination_type=destination.type,
+    )
     db.add(run)
     version.review_status = PipelineVersionReviewStatus.pending_review if success else PipelineVersionReviewStatus.testing
     _audit(db, actor_id, "pipeline_version.ready_for_review" if success else "pipeline_version.test_failed", "pipeline_version", version.id)
@@ -560,6 +744,7 @@ def run_file_generation(file_id: str, max_retries: int, actor_id: str) -> None:
 
 def _run_file_generation_locked(db, pipeline, version, file: PipelineVersionFile, max_retries: int, actor_id: uuid.UUID) -> None:
     from models import ConnectionProfile
+    healing_events: list = []  # see _run_pipeline_generation_locked
     source = db.get(ConnectionProfile, pipeline.source_connection_id)
     destination = db.get(ConnectionProfile, pipeline.destination_connection_id)
     if source is None or destination is None:
@@ -736,7 +921,7 @@ def _run_file_generation_locked(db, pipeline, version, file: PipelineVersionFile
             success, attempts, logs, final_code = execute_with_self_healing(
                 script_path, schema_for_generation, max_retries, source_url, destination_url,
                 extra_env=extra_env, needs_source_db=needs_source_db, source_files_dir=source_files_dir,
-                needs_dest_db=needs_dest_db,
+                needs_dest_db=needs_dest_db, healing_recorder=healing_events.append,
             )
             file.generated_code = final_code
         finally:
@@ -758,6 +943,15 @@ def _run_file_generation_locked(db, pipeline, version, file: PipelineVersionFile
             )
             quality_result = run_quality_checks(destination_url, quality_schema, quality_table)
             row_count = quality_result.get("row_count")
+
+            final_code, quality_result, row_count = _attempt_quality_driven_heal(
+                quality_result, final_code, schema_for_generation,
+                destination_url, quality_schema, quality_table,
+                source_db_url=source_url, extra_env=extra_env,
+                needs_source_db=needs_source_db, source_files_dir=source_files_dir,
+                needs_dest_db=needs_dest_db, healing_recorder=healing_events.append,
+            )
+            file.generated_code = final_code
         except Exception as exc:
             quality_result = {"checked": False, "reason": f"Quality check itself failed: {exc}"}
 
@@ -767,6 +961,10 @@ def _run_file_generation_locked(db, pipeline, version, file: PipelineVersionFile
                       started_at=started_at, finished_at=datetime.now(timezone.utc),
                       log_output=logs if success else None, error_output=None if success else logs,
                       row_count=row_count, quality_checks=quality_result)
+    record_healing_events(
+        db, healing_events, project_id=pipeline.project_id, pipeline_id=pipeline.id,
+        version_id=version.id, file_id=file.id, source_type=source.type, destination_type=destination.type,
+    )
     db.add(run)
     file.review_status = PipelineVersionReviewStatus.pending_review if success else PipelineVersionReviewStatus.testing
     _audit(db, actor_id,

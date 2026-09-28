@@ -87,7 +87,21 @@ def introspect_schema(schema_name: str = None, sample_rows: int = 3, db_url: str
             # happened to be "public" (on the default search path).
             # SQLite has no schema concept the same way, so only
             # qualify for a real schema-aware engine.
-            qualified_name = f'"{s_name}"."{t_name}"' if "sqlite" not in db_url else f'"{t_name}"'
+            #
+            # Identifier quoting comes from the engine's own dialect,
+            # not hand-built double quotes. Hand-quoting broke Snowflake:
+            # its SQLAlchemy dialect returns lowercase names for
+            # case-insensitive objects (Snowflake stores them uppercase),
+            # and a double-quoted lowercase name is a DIFFERENT, nonexistent
+            # case-sensitive table there - the count query failed, and the
+            # except below silently turned that into row_count = 0. The
+            # dialect's own preparer quotes only when a name genuinely
+            # needs it, matching how that dialect reflected the name.
+            if "sqlite" in db_url:
+                qualified_name = f'"{t_name}"'
+            else:
+                preparer = engine.dialect.identifier_preparer
+                qualified_name = f"{preparer.quote_schema(s_name)}.{preparer.quote(t_name)}"
 
             # Column extraction
             raw_columns = inspector.get_columns(t_name, schema=schema_name)
@@ -863,6 +877,128 @@ def introspect_files(files: list, sample_rows: int = 3) -> dict:
             sample_rows=sample_rows,
         )
     return tables
+
+
+def _introspect_object_keys(keys: list, download_fn, sample_rows: int, schema_label: str) -> dict:
+    """The download-then-introspect half shared by every object-store
+    source (S3/MinIO, Azure Blob). Each key is downloaded to a temporary
+    local file and handed to the EXISTING, unmodified introspect_file(),
+    which reads via a plain open(path, ...) and can't take bytes over the
+    network - so genuinely reusing its CSV/JSON logic means giving it a
+    real local path, not duplicating that logic per storage provider.
+
+    download_fn(key, local_path) is the only provider-specific piece -
+    each caller supplies its own SDK's way of fetching one object.
+
+    One unreadable or corrupt object never fails introspection of the
+    whole bucket - it's recorded with an "error" field and skipped, the
+    same "skip and continue" philosophy introspect_redis() already
+    applies to one stale key.
+    """
+    import tempfile
+
+    tables: dict = {}
+    for key in keys:
+        file_format = "csv" if key.lower().endswith(".csv") else "json"
+        suffix = ".csv" if file_format == "csv" else ".json"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            download_fn(key, tmp_path)
+            tables[key] = introspect_file(path=tmp_path, filename=key, file_format=file_format, sample_rows=sample_rows)
+        except Exception as exc:
+            tables[key] = {"schema": schema_label, "table": key, "columns": [], "row_count": 0, "sample": [], "error": str(exc)}
+        finally:
+            os.unlink(tmp_path)
+    return tables
+
+
+def introspect_s3(client, bucket: str, prefix: str = "", sample_rows: int = 3, max_objects: int = 20) -> dict:
+    """Introspects an S3/MinIO-compatible bucket the same way
+    introspect_files() introspects a multi-file upload source - each
+    sampled object becomes its own entry in the SAME {name: {columns,
+    row_count, sample}} shape everything downstream already expects,
+    so an S3 source needs no special-casing anywhere else, matching the
+    same design already established for uploaded files and Redis.
+
+    Only .csv and .json objects are considered - introspect_file() only
+    supports those two formats, so listing anything else would just be
+    discarded work.
+
+    Bounded by max_objects, not the whole bucket - a real bucket can
+    hold thousands of objects; this is schema *inference*, not a full
+    data read, so a small sample is enough to establish structure. Each
+    sampled object is downloaded to a temporary local file and handed
+    to the EXISTING, unmodified introspect_file() - which reads via a
+    plain open(path, ...) and has no way to accept bytes over the
+    network directly - rather than duplicating its CSV/JSON-parsing
+    logic for a second, S3-specific code path.
+
+    client is a boto3 S3 client, already configured for the right
+    account/region/endpoint (MinIO included) by the caller - resolving
+    that is connection_service.py's job, not this module's, the same
+    division of responsibility introspect_api() already has for
+    already-resolved auth_headers.
+    """
+    continuation_token = None
+    candidates: list = []
+
+    # Paginate list_objects_v2 until either enough CSV/JSON candidates
+    # are found or the bucket (or its prefix) is exhausted - a bucket
+    # can easily have far more non-matching objects before the first
+    # matching one than a single, unbounded MaxKeys call would return.
+    while len(candidates) < max_objects:
+        kwargs = {"Bucket": bucket, "MaxKeys": 1000}
+        if prefix:
+            kwargs["Prefix"] = prefix
+        if continuation_token:
+            kwargs["ContinuationToken"] = continuation_token
+        response = client.list_objects_v2(**kwargs)
+        for obj in response.get("Contents", []):
+            key = obj["Key"]
+            lower = key.lower()
+            if lower.endswith(".csv") or lower.endswith(".json"):
+                candidates.append(key)
+                if len(candidates) >= max_objects:
+                    break
+        if not response.get("IsTruncated"):
+            break
+        continuation_token = response.get("NextContinuationToken")
+
+    return _introspect_object_keys(
+        candidates, lambda key, path: client.download_file(bucket, key, path), sample_rows, "s3",
+    )
+
+
+def introspect_azure_blob(container_client, prefix: str = "", sample_rows: int = 3, max_objects: int = 20) -> dict:
+    """Azure Blob counterpart to introspect_s3() - same return shape,
+    same CSV/JSON-only filtering, same max_objects bound, and the same
+    shared download-then-introspect helper, so an Azure source needs no
+    special-casing anywhere downstream either.
+
+    container_client is an azure-storage-blob ContainerClient already
+    authenticated by the caller (connection_service.py's job, not this
+    module's). list_blobs() returns a lazily-paging iterator, so
+    breaking out once max_objects candidates are found stops fetching
+    further pages - no manual pagination needed here, unlike S3's
+    ContinuationToken loop.
+    """
+    candidates: list = []
+    list_kwargs = {"name_starts_with": prefix} if prefix else {}
+    for blob in container_client.list_blobs(**list_kwargs):
+        lower = blob.name.lower()
+        if lower.endswith(".csv") or lower.endswith(".json"):
+            candidates.append(blob.name)
+            if len(candidates) >= max_objects:
+                break
+
+    def download(key: str, local_path: str) -> None:
+        # readinto streams straight to the file handle, rather than
+        # readall() holding an entire large blob in memory first.
+        with open(local_path, "wb") as f:
+            container_client.download_blob(key).readinto(f)
+
+    return _introspect_object_keys(candidates, download, sample_rows, "azure_blob")
 
 
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)

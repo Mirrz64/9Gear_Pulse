@@ -322,6 +322,9 @@ def _validate_azure_blob_shape(credentials: dict[str, Any]) -> None:
         raise CredentialResolutionError(
             f"Azure Blob Storage credentials require container, azure_storage_account_name, and azure_storage_account_key - missing: {', '.join(missing)}."
         )
+    prefix = credentials.get("prefix")
+    if prefix is not None and not isinstance(prefix, str):
+        raise CredentialResolutionError("Azure Blob prefix must be a string if provided.")
 
 
 def _validate_s3_shape(credentials: dict[str, Any]) -> None:
@@ -341,7 +344,7 @@ def _validate_s3_shape(credentials: dict[str, Any]) -> None:
         raise CredentialResolutionError(
             f"S3 credentials require bucket, aws_access_key_id, and aws_secret_access_key - missing: {', '.join(missing)}."
         )
-    for optional_field in ("region", "endpoint_url"):
+    for optional_field in ("region", "endpoint_url", "prefix"):
         value = credentials.get(optional_field)
         if value is not None and not isinstance(value, str):
             raise CredentialResolutionError(f"S3 {optional_field} must be a string if provided.")
@@ -687,6 +690,47 @@ def s3_credentials(profile: ConnectionProfile) -> dict[str, Any]:
     return result
 
 
+def s3_boto_client_and_prefix(profile: ConnectionProfile) -> tuple[Any, str, str]:
+    """Source-side counterpart to s3_credentials() - that resolver builds
+    what dlt's native filesystem destination needs (a bucket_url string
+    plus a credentials dict); introspection instead needs a real boto3
+    client to actually list and fetch bucket objects, which is a
+    genuinely different shape of the same stored credentials, not a
+    different set of them - independently resolved here via its own
+    decrypt_credentials(profile) call, matching how every other
+    resolver in this file is self-contained rather than chaining off
+    another resolver's output.
+
+    boto3 is imported locally, not at module level, matching this
+    codebase's established convention for heavy/optional dependencies
+    (docker, redis) elsewhere.
+
+    Returns (client, bucket, prefix) - prefix is "" when not set,
+    matching list_objects_v2's own convention that an empty prefix
+    means "the whole bucket", so callers never need a None-check.
+    """
+    import boto3
+
+    credentials = decrypt_credentials(profile)
+    bucket = credentials.get("bucket")
+    access_key = credentials.get("aws_access_key_id")
+    secret_key = credentials.get("aws_secret_access_key")
+    if not all([bucket, access_key, secret_key]):
+        raise CredentialResolutionError("S3 credentials require bucket, aws_access_key_id, and aws_secret_access_key.")
+
+    client_kwargs = {"aws_access_key_id": access_key, "aws_secret_access_key": secret_key}
+    if credentials.get("region"):
+        client_kwargs["region_name"] = credentials["region"]
+    if credentials.get("endpoint_url"):
+        # What makes this same client work against MinIO (or any other
+        # S3-API-compatible service), not just real AWS S3.
+        client_kwargs["endpoint_url"] = credentials["endpoint_url"]
+
+    client = boto3.client("s3", **client_kwargs)
+    prefix = (credentials.get("prefix") or "").strip()
+    return client, bucket, prefix
+
+
 def azure_blob_credentials(profile: ConnectionProfile) -> dict[str, Any]:
     """Mirrors s3_credentials() exactly - same filesystem destination
     mechanism, same bucket_url-plus-credentials-dict shape, just
@@ -704,6 +748,35 @@ def azure_blob_credentials(profile: ConnectionProfile) -> dict[str, Any]:
         "azure_storage_account_name": account_name,
         "azure_storage_account_key": account_key,
     }
+
+
+def azure_blob_client_and_prefix(profile: ConnectionProfile) -> tuple[Any, str]:
+    """Source-side counterpart to azure_blob_credentials() - that resolver
+    builds what dlt's filesystem destination needs (a bucket_url plus a
+    credentials dict); introspection instead needs a real ContainerClient
+    to list and fetch blobs. Same stored fields, a different shape of
+    them, independently resolved via its own decrypt_credentials() call
+    like every other resolver in this file.
+
+    Account-key auth only, matching the scope already established for
+    this connection type. azure-storage-blob is imported locally, the
+    same convention s3_boto_client_and_prefix() follows for boto3.
+
+    Returns (container_client, prefix) - prefix is "" when not set,
+    which list_blobs treats as "the whole container".
+    """
+    from azure.storage.blob import BlobServiceClient
+
+    credentials = decrypt_credentials(profile)
+    container = credentials.get("container")
+    account_name = credentials.get("azure_storage_account_name")
+    account_key = credentials.get("azure_storage_account_key")
+    if not all([container, account_name, account_key]):
+        raise CredentialResolutionError("Azure Blob Storage credentials require container, azure_storage_account_name, and azure_storage_account_key.")
+
+    service = BlobServiceClient(account_url=f"https://{account_name}.blob.core.windows.net", credential=account_key)
+    prefix = (credentials.get("prefix") or "").strip()
+    return service.get_container_client(container), prefix
 
 
 def bigquery_credentials(profile: ConnectionProfile) -> dict[str, Any]:
@@ -735,3 +808,53 @@ def bigquery_credentials(profile: ConnectionProfile) -> dict[str, Any]:
         "client_email": client_email,
         "location": credentials.get("location") or "US",
     }
+
+
+def snowflake_url(profile: ConnectionProfile) -> str:
+    """Source-side counterpart to snowflake_credentials() - that resolver
+    builds the dict dlt's native destination needs; this builds a plain
+    SQLAlchemy connection string for introspect_schema()'s own generic
+    reflection, which needs a URL, not a credentials dict. Both read the
+    exact same stored fields (account/username/password/database) - two
+    different shapes of the same underlying credentials, not two
+    different things a user has to configure separately.
+
+    Schema is deliberately left out of the URL - confirmed directly
+    against Snowflake's own docs that it's optional there, and every
+    other SQL-like source in this project already resolves schema
+    separately (see snowflake_schema_name() below) rather than baking
+    it into the connection string, so this stays consistent with that.
+    """
+    credentials = decrypt_credentials(profile)
+    account = credentials.get("account")
+    username = credentials.get("username")
+    password = credentials.get("password")
+    database = credentials.get("database")
+    if not all([account, username, password, database]):
+        raise CredentialResolutionError("Snowflake credentials require account, username, password, and database.")
+    url = f"snowflake://{username}:{password}@{account}/{database}"
+    # warehouse and role ride along as query params when the profile
+    # sets them. Without an active warehouse Snowflake rejects any query
+    # that actually reads data (row counts during introspection, and the
+    # generated pipeline's own reads at execution time) - metadata-only
+    # reflection works without one, which is exactly why leaving them
+    # out looks fine until the first real read.
+    from urllib.parse import quote
+    params = []
+    if credentials.get("warehouse"):
+        params.append(f"warehouse={quote(str(credentials['warehouse']), safe='')}")
+    if credentials.get("role"):
+        params.append(f"role={quote(str(credentials['role']), safe='')}")
+    return url + ("?" + "&".join(params) if params else "")
+
+
+def snowflake_schema_name(profile: ConnectionProfile) -> str:
+    """Mirrors postgres_schema_name()/azure_sql_schema_name() exactly,
+    with Snowflake's own conventional default: every Snowflake database
+    ships with a default schema literally named PUBLIC (Snowflake's own
+    platform convention, not something that varies by dlt/library
+    version the way the other integration details in this project
+    needed verifying).
+    """
+    credentials = decrypt_credentials(profile)
+    return credentials.get("schema") or "PUBLIC"

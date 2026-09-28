@@ -28,7 +28,9 @@ from typing import List
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 import anthropic
-from ai_provider import call_with_rate_limit_backoff
+from ai_provider import call_with_rate_limit_backoff, stream_structured_message
+from model_config import get_model_for_stage, get_thinking_kwargs_for_stage, PipelineStage
+from vetted_patterns import patterns_for_code_generation
 import openai
 
 load_dotenv(override=False)
@@ -511,6 +513,133 @@ the exact same guidance already given above for those variables.
   a SOAP client library like zeep - it is not installed in the sandbox; \
   build and parse the envelope directly with requests and \
   xml.etree.ElementTree as shown above.
+- For an S3/MinIO source, SOURCE_DB_URL, SOURCE_API_BASE_URL, and \
+SOURCE_FILES_DIR will all be absent - do not reference any of them. \
+Connect using these environment variables:
+    - SOURCE_S3_BUCKET_URL - the bucket location, already in "s3://bucket" \
+form (this same s3:// scheme is also what MinIO uses here, since it's \
+S3-API-compatible - the actual connection details differ, but the URL \
+scheme dlt is given does not)
+    - SOURCE_S3_ACCESS_KEY_ID / SOURCE_S3_SECRET_ACCESS_KEY - credentials, \
+always present
+    - SOURCE_S3_REGION - present only when the profile specifies a region
+    - SOURCE_S3_ENDPOINT_URL - present only for MinIO or another \
+S3-API-compatible service; absent for real AWS S3
+    - SOURCE_S3_PREFIX - present only when the profile scopes to a \
+specific folder/prefix within the bucket; absent means read the whole \
+bucket
+
+  Use dlt's own filesystem source to LIST matching objects, then read and \
+parse each file's raw content yourself - never dlt's read_csv() or \
+read_jsonl() transformers for this. read_jsonl() specifically expects \
+JSON-LINES format (one JSON object per line), while a real JSON export \
+is far more often a single array of objects - guessing wrong between the \
+two silently produces broken or empty output rather than a visible \
+error, so parse it explicitly instead of leaving the choice to a \
+transformer that assumes one specific shape:
+
+      import os, csv, json, io
+      import dlt
+      from dlt.sources.filesystem import filesystem
+
+      credentials = {
+          "aws_access_key_id": os.environ["SOURCE_S3_ACCESS_KEY_ID"],
+          "aws_secret_access_key": os.environ["SOURCE_S3_SECRET_ACCESS_KEY"],
+      }
+      if "SOURCE_S3_REGION" in os.environ:
+          credentials["region_name"] = os.environ["SOURCE_S3_REGION"]
+      if "SOURCE_S3_ENDPOINT_URL" in os.environ:
+          credentials["endpoint_url"] = os.environ["SOURCE_S3_ENDPOINT_URL"]
+
+      prefix = os.environ.get("SOURCE_S3_PREFIX", "")
+      # Match the actual file type this goal needs - swap the extension
+      # below for whichever one the schema summary's entries actually are.
+      file_glob = f"{prefix}*.csv" if prefix else "*.csv"
+
+      files = filesystem(
+          bucket_url=os.environ["SOURCE_S3_BUCKET_URL"],
+          file_glob=file_glob,
+          credentials=credentials,
+          extract_content=True,
+      )
+
+      @dlt.resource
+      def read_bucket_files():
+          for file_item in files:
+              raw = file_item["file_content"].decode("utf-8")
+              name = file_item["file_name"].lower()
+              if name.endswith(".csv"):
+                  reader = csv.DictReader(io.StringIO(raw))
+                  for row in reader:
+                      yield dict(row)
+              elif name.endswith(".json"):
+                  data = json.loads(raw)
+                  records = data if isinstance(data, list) else [data]
+                  for record in records:
+                      yield record
+
+  Only one file type will actually be relevant for any given goal - keep \
+whichever branch (.csv or .json) matches what the schema summary's \
+entries actually are, and set file_glob to that same extension; there is \
+no need to keep both branches or guess, since the schema summary already \
+shows exactly which format the sampled objects were.
+- For an Azure Blob Storage source, SOURCE_DB_URL, SOURCE_API_BASE_URL, and \
+SOURCE_FILES_DIR will all be absent - do not reference any of them. \
+Connect using these environment variables:
+    - SOURCE_AZURE_BLOB_BUCKET_URL - the container location, already in \
+"az://container" form
+    - SOURCE_AZURE_BLOB_ACCOUNT_NAME / SOURCE_AZURE_BLOB_ACCOUNT_KEY - \
+credentials, always present
+    - SOURCE_AZURE_BLOB_PREFIX - present only when the profile scopes to a \
+specific folder/prefix within the container; absent means read the whole \
+container
+
+  This works exactly like the S3/MinIO source above - dlt's own filesystem \
+source LISTS matching blobs, and you read and parse each file's raw content \
+yourself, for the same reason: never dlt's read_csv() or read_jsonl() \
+transformers, since read_jsonl() expects JSON-LINES format while a real \
+JSON export is far more often a single array of objects. Only the \
+credentials differ:
+
+      import os, csv, json, io
+      import dlt
+      from dlt.sources.filesystem import filesystem
+
+      credentials = {
+          "azure_storage_account_name": os.environ["SOURCE_AZURE_BLOB_ACCOUNT_NAME"],
+          "azure_storage_account_key": os.environ["SOURCE_AZURE_BLOB_ACCOUNT_KEY"],
+      }
+
+      prefix = os.environ.get("SOURCE_AZURE_BLOB_PREFIX", "")
+      # Match the actual file type this goal needs - swap the extension
+      # below for whichever one the schema summary's entries actually are.
+      file_glob = f"{prefix}*.csv" if prefix else "*.csv"
+
+      files = filesystem(
+          bucket_url=os.environ["SOURCE_AZURE_BLOB_BUCKET_URL"],
+          file_glob=file_glob,
+          credentials=credentials,
+          extract_content=True,
+      )
+
+      @dlt.resource
+      def read_container_files():
+          for file_item in files:
+              raw = file_item["file_content"].decode("utf-8")
+              name = file_item["file_name"].lower()
+              if name.endswith(".csv"):
+                  reader = csv.DictReader(io.StringIO(raw))
+                  for row in reader:
+                      yield dict(row)
+              elif name.endswith(".json"):
+                  data = json.loads(raw)
+                  records = data if isinstance(data, list) else [data]
+                  for record in records:
+                      yield record
+
+  As with S3, keep only the branch (.csv or .json) that matches what the \
+schema summary's entries actually are, and set file_glob to that same \
+extension.
 
 Destination Requirements — this is mandatory, do not deviate:
 - Check first whether DEST_REDIS_URL is set in the environment. If it is, \
@@ -771,6 +900,15 @@ options here unless this file's own goal text explicitly describes a \
 pinned schema for it - BigQuery destinations do not support that feature \
 in this project yet.
 
+If the approved build plan names one of the vetted patterns below for a \
+step, adapt its reference snippet to the real field/table names in play - \
+these are proven, correct implementations, not just illustrations. If a \
+step doesn't match any of these, write whatever custom logic it actually \
+needs, exactly as you always have; this list is never a constraint on \
+what you're allowed to write.
+
+""" + patterns_for_code_generation() + """
+
 Data Shape Requirements:
 - Never yield a native Python list or dict as a field's value unless you \
 specifically want dlt to split it into a separate child table - that is \
@@ -833,7 +971,9 @@ def generate_pipeline(schema_summary: dict, goal: str) -> dict:
     # Primary Attempt: Anthropic Claude Sonnet 5, via native structured outputs.
     if anthropic_client:
         try:
-            print("[Generator] Contacting Primary AI Provider: Anthropic (Claude Sonnet 5)...")
+            model_id = get_model_for_stage(PipelineStage.CODE_GENERATION)
+            thinking_kwargs = get_thinking_kwargs_for_stage(PipelineStage.CODE_GENERATION)
+            print(f"[Generator] Contacting Primary AI Provider: Anthropic ({model_id})...")
             # 8000 wasn't enough (stop_reason=max_tokens on a demanding
             # goal); 32000 was enough content-wise but tripped the SDK's
             # own "streaming required for long requests" guard - a
@@ -846,10 +986,20 @@ def generate_pipeline(schema_summary: dict, goal: str) -> dict:
             # the structured JSON response, so a modest, fixed number is
             # both safely under the streaming threshold and still
             # generous for the response content alone.
-            response = call_with_rate_limit_backoff(lambda: anthropic_client.messages.parse(
-                model="claude-sonnet-5",
-                max_tokens=16000,
-                thinking={"type": "disabled"},
+            #
+            # That reasoning holds exactly as long as this stage stays on
+            # Sonnet (disabled thinking). If a PULSE_MODEL_CODE_GENERATION
+            # override ever routes it to Opus/Fable instead, thinking
+            # becomes mandatory and shares the budget again - same
+            # tradeoff as before, just with adaptive thinking's own
+            # unpredictable share instead of Sonnet's, so it needs the
+            # same larger ceiling propose_architecture.py's own fix uses.
+            max_tokens = 64000 if thinking_kwargs["thinking"]["type"] == "adaptive" else 16000
+            response = call_with_rate_limit_backoff(lambda: stream_structured_message(
+                anthropic_client,
+                model=model_id,
+                max_tokens=max_tokens,
+                **thinking_kwargs,
                 system=SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": user_content}],
                 output_format=GeneratedPipeline,

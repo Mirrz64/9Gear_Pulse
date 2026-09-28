@@ -52,10 +52,11 @@ from models import (
 )
 from session import get_db
 from connection_service import (
-    CredentialResolutionError, api_credentials, azure_sql_schema_name, azure_sql_url, decrypt_credentials, file_credentials,
-    graphql_credentials, postgres_url, postgres_schema_name, redis_url, soap_credentials, validate_credentials_shape,
+    CredentialResolutionError, api_credentials, azure_blob_client_and_prefix, azure_sql_schema_name, azure_sql_url, decrypt_credentials, file_credentials,
+    graphql_credentials, postgres_url, postgres_schema_name, redis_url, s3_boto_client_and_prefix, snowflake_schema_name, snowflake_url, soap_credentials, validate_credentials_shape,
 )
-from introspect import introspect_api, introspect_files, introspect_graphql, introspect_redis, introspect_schema, introspect_soap
+from healing_ledger import get_healing_stats
+from introspect import introspect_api, introspect_azure_blob, introspect_files, introspect_graphql, introspect_redis, introspect_s3, introspect_schema, introspect_soap
 from schedule_service import job_id, register_schedule, scheduler
 from apscheduler.jobstores.base import JobLookupError
 
@@ -363,6 +364,17 @@ def list_project_pipelines(project_id: uuid.UUID, db: Session = Depends(get_db),
         select(Pipeline).where(Pipeline.project_id == project_id).order_by(Pipeline.version.desc())
     )
     return {"pipelines": [{"id": p.id, "status": p.status, "version": p.version} for p in pipelines]}
+
+
+@router.get("/healing/stats")
+def healing_stats(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Self-healing ledger summary: how often AI fixes actually worked,
+    broken down by attempt number, model, trigger and error type.
+    Scoped to the calling user's OWN projects only - ownership is
+    enforced by the query's join to Project.owner_id, the same scoping
+    list_projects uses, so one user never sees another's ledger.
+    """
+    return get_healing_stats(db, current_user.id)
 
 
 @router.patch("/projects/{project_id}")
@@ -766,6 +778,13 @@ def introspect_connection_profile(profile_id: uuid.UUID, db: Session = Depends(g
             schema = introspect_schema(
                 db_url=azure_sql_url(profile), schema_name=azure_sql_schema_name(profile), sample_rows=0,
             )
+        elif profile.type == ConnectionType.snowflake:
+            # Same reasoning as azure_sql above - snowflake-sqlalchemy
+            # is a generic SQLAlchemy dialect, so introspect_schema()
+            # needs no changes here either.
+            schema = introspect_schema(
+                db_url=snowflake_url(profile), schema_name=snowflake_schema_name(profile), sample_rows=0,
+            )
         elif profile.type == ConnectionType.api:
             creds = api_credentials(profile)
             schema = introspect_api(
@@ -776,6 +795,12 @@ def introspect_connection_profile(profile_id: uuid.UUID, db: Session = Depends(g
             )
         elif profile.type == ConnectionType.file:
             schema = introspect_files(file_credentials(profile), sample_rows=0)
+        elif profile.type == ConnectionType.s3:
+            client, bucket, prefix = s3_boto_client_and_prefix(profile)
+            schema = introspect_s3(client, bucket, prefix, sample_rows=0)
+        elif profile.type == ConnectionType.azure_blob:
+            container_client, prefix = azure_blob_client_and_prefix(profile)
+            schema = introspect_azure_blob(container_client, prefix, sample_rows=0)
         elif profile.type == ConnectionType.redis:
             schema = introspect_redis(redis_url(profile))
         elif profile.type == ConnectionType.graphql:
@@ -794,7 +819,7 @@ def introspect_connection_profile(profile_id: uuid.UUID, db: Session = Depends(g
                 source_name=profile.name, sample_rows=0,
             )
         else:
-            raise HTTPException(status_code=422, detail="Only Postgres, Azure SQL, API, file, Redis, GraphQL, and SOAP connection profiles are supported in v1")
+            raise HTTPException(status_code=422, detail="Only Postgres, Azure SQL, Snowflake, API, file, S3/MinIO, Azure Blob, Redis, GraphQL, and SOAP connection profiles are supported in v1")
     except CredentialResolutionError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except requests.RequestException as exc:

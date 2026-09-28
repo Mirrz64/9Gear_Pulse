@@ -25,7 +25,7 @@ export const CONNECTOR_CATEGORIES: ConnectorCategory[] = [
   {
     slug: 'analytical-warehouses',
     label: 'Analytical Warehouses',
-    description: 'Write to a big-data warehouse destination.',
+    description: 'Read from or write to a big-data warehouse.',
     connectors: [
       { type: 'snowflake', label: 'Snowflake' },
       { type: 'bigquery', label: 'BigQuery' },
@@ -34,7 +34,7 @@ export const CONNECTOR_CATEGORIES: ConnectorCategory[] = [
   {
     slug: 'object-storage',
     label: 'Object Storage',
-    description: 'Write files into a bucket or container.',
+    description: 'Read files from or write files into a bucket or container.',
     connectors: [
       { type: 's3', label: 'S3 / MinIO' },
       { type: 'azure_blob', label: 'Azure Blob Storage' },

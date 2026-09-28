@@ -8,6 +8,16 @@ const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
 
 export type SourceType = 'postgres' | 'azure_sql' | 'snowflake' | 's3' | 'azure_blob' | 'bigquery' | 'api' | 'file' | 'redis' | 'graphql' | 'soap';
 
+// These four were deliberately scoped destination-only this session -
+// reading from them as a source would need new introspection logic
+// (Snowflake/BigQuery: a backend-side driver never confirmed installed;
+// S3/Azure Blob: listing bucket objects and sampling files, a genuinely
+// different mechanism from SQL reflection) that was never built. The
+// backend's introspect endpoint has no branch for any of them and
+// always rejects - not a bug, but the UI needs to know this so it
+// doesn't show an "Introspect" button that can only ever fail.
+const DESTINATION_ONLY_TYPES = new Set(['bigquery']);
+
 interface ConnectionProfile {
   id: string;
   name: string;
@@ -97,6 +107,7 @@ export default function ConnectionProfiles({
   const [editSnowflakeUsername, setEditSnowflakeUsername] = useState('');
   const [editSnowflakePassword, setEditSnowflakePassword] = useState('');
   const [editSnowflakeDatabase, setEditSnowflakeDatabase] = useState('');
+  const [editSnowflakeSchema, setEditSnowflakeSchema] = useState('');
   const [editSnowflakeWarehouse, setEditSnowflakeWarehouse] = useState('');
   const [editSnowflakeRole, setEditSnowflakeRole] = useState('');
   const [editS3Bucket, setEditS3Bucket] = useState('');
@@ -104,9 +115,11 @@ export default function ConnectionProfiles({
   const [editS3SecretAccessKey, setEditS3SecretAccessKey] = useState('');
   const [editS3Region, setEditS3Region] = useState('');
   const [editS3EndpointUrl, setEditS3EndpointUrl] = useState('');
+  const [editS3Prefix, setEditS3Prefix] = useState('');
   const [editAzureBlobContainer, setEditAzureBlobContainer] = useState('');
   const [editAzureBlobAccountName, setEditAzureBlobAccountName] = useState('');
   const [editAzureBlobAccountKey, setEditAzureBlobAccountKey] = useState('');
+  const [editAzureBlobPrefix, setEditAzureBlobPrefix] = useState('');
   const [editBigqueryServiceAccountJson, setEditBigqueryServiceAccountJson] = useState('');
   const [editBigqueryLocation, setEditBigqueryLocation] = useState('');
   const [editBaseUrl, setEditBaseUrl] = useState('');
@@ -159,9 +172,9 @@ export default function ConnectionProfiles({
     setEditName(profile.name);
     setEditHost(''); setEditPort(''); setEditDatabase(''); setEditUsername(''); setEditPassword(''); setEditSchema('');
     setEditAzureSqlHost(''); setEditAzureSqlPort(''); setEditAzureSqlDatabase(''); setEditAzureSqlUsername(''); setEditAzureSqlPassword(''); setEditAzureSqlSchema('');
-    setEditSnowflakeAccount(''); setEditSnowflakeUsername(''); setEditSnowflakePassword(''); setEditSnowflakeDatabase(''); setEditSnowflakeWarehouse(''); setEditSnowflakeRole('');
-    setEditS3Bucket(''); setEditS3AccessKeyId(''); setEditS3SecretAccessKey(''); setEditS3Region(''); setEditS3EndpointUrl('');
-    setEditAzureBlobContainer(''); setEditAzureBlobAccountName(''); setEditAzureBlobAccountKey('');
+    setEditSnowflakeAccount(''); setEditSnowflakeUsername(''); setEditSnowflakePassword(''); setEditSnowflakeDatabase(''); setEditSnowflakeSchema(''); setEditSnowflakeWarehouse(''); setEditSnowflakeRole('');
+    setEditS3Bucket(''); setEditS3AccessKeyId(''); setEditS3SecretAccessKey(''); setEditS3Region(''); setEditS3EndpointUrl(''); setEditS3Prefix('');
+    setEditAzureBlobContainer(''); setEditAzureBlobAccountName(''); setEditAzureBlobAccountKey(''); setEditAzureBlobPrefix('');
     setEditBigqueryServiceAccountJson(''); setEditBigqueryLocation('');
     setEditBaseUrl(''); setEditAuthHeaderRows([{ key: '', value: '' }]);
     setEditApiMethod(null); setEditApiRequestBody('');
@@ -210,6 +223,7 @@ export default function ConnectionProfiles({
   const [snowflakeUsername, setSnowflakeUsername] = useState('');
   const [snowflakePassword, setSnowflakePassword] = useState('');
   const [snowflakeDatabase, setSnowflakeDatabase] = useState('');
+  const [snowflakeSchema, setSnowflakeSchema] = useState('');
   const [snowflakeWarehouse, setSnowflakeWarehouse] = useState('');
   const [snowflakeRole, setSnowflakeRole] = useState('');
   const [s3Bucket, setS3Bucket] = useState('');
@@ -217,9 +231,11 @@ export default function ConnectionProfiles({
   const [s3SecretAccessKey, setS3SecretAccessKey] = useState('');
   const [s3Region, setS3Region] = useState('');
   const [s3EndpointUrl, setS3EndpointUrl] = useState('');
+  const [s3Prefix, setS3Prefix] = useState('');
   const [azureBlobContainer, setAzureBlobContainer] = useState('');
   const [azureBlobAccountName, setAzureBlobAccountName] = useState('');
   const [azureBlobAccountKey, setAzureBlobAccountKey] = useState('');
+  const [azureBlobPrefix, setAzureBlobPrefix] = useState('');
   const [bigqueryServiceAccountJson, setBigqueryServiceAccountJson] = useState('');
   const [bigqueryLocation, setBigqueryLocation] = useState('');
 
@@ -333,6 +349,7 @@ export default function ConnectionProfiles({
     setSnowflakeUsername('');
     setSnowflakePassword('');
     setSnowflakeDatabase('');
+    setSnowflakeSchema('');
     setSnowflakeWarehouse('');
     setSnowflakeRole('');
     setS3Bucket('');
@@ -340,9 +357,11 @@ export default function ConnectionProfiles({
     setS3SecretAccessKey('');
     setS3Region('');
     setS3EndpointUrl('');
+    setS3Prefix('');
     setAzureBlobContainer('');
     setAzureBlobAccountName('');
     setAzureBlobAccountKey('');
+    setAzureBlobPrefix('');
     setBigqueryServiceAccountJson('');
     setBigqueryLocation('');
     setBaseUrl('');
@@ -454,6 +473,7 @@ export default function ConnectionProfiles({
               username: snowflakeUsername,
               password: snowflakePassword,
               database: snowflakeDatabase,
+              ...(snowflakeSchema.trim() ? { schema: snowflakeSchema.trim() } : {}),
               ...(snowflakeWarehouse.trim() ? { warehouse: snowflakeWarehouse.trim() } : {}),
               ...(snowflakeRole.trim() ? { role: snowflakeRole.trim() } : {}),
             }
@@ -464,12 +484,14 @@ export default function ConnectionProfiles({
               aws_secret_access_key: s3SecretAccessKey,
               ...(s3Region.trim() ? { region: s3Region.trim() } : {}),
               ...(s3EndpointUrl.trim() ? { endpoint_url: s3EndpointUrl.trim() } : {}),
+              ...(s3Prefix.trim() ? { prefix: s3Prefix.trim() } : {}),
             }
           : sourceType === 'azure_blob'
           ? {
               container: azureBlobContainer,
               azure_storage_account_name: azureBlobAccountName,
               azure_storage_account_key: azureBlobAccountKey,
+              ...(azureBlobPrefix.trim() ? { prefix: azureBlobPrefix.trim() } : {}),
             }
           : sourceType === 'bigquery'
           ? {
@@ -704,6 +726,7 @@ export default function ConnectionProfiles({
         if (editSnowflakeUsername.trim()) creds.username = editSnowflakeUsername.trim();
         if (editSnowflakePassword) creds.password = editSnowflakePassword;
         if (editSnowflakeDatabase.trim()) creds.database = editSnowflakeDatabase.trim();
+        if (editSnowflakeSchema.trim()) creds.schema = editSnowflakeSchema.trim();
         if (editSnowflakeWarehouse.trim()) creds.warehouse = editSnowflakeWarehouse.trim();
         if (editSnowflakeRole.trim()) creds.role = editSnowflakeRole.trim();
         if (Object.keys(creds).length) body.credentials = creds;
@@ -714,12 +737,14 @@ export default function ConnectionProfiles({
         if (editS3SecretAccessKey) creds.aws_secret_access_key = editS3SecretAccessKey;
         if (editS3Region.trim()) creds.region = editS3Region.trim();
         if (editS3EndpointUrl.trim()) creds.endpoint_url = editS3EndpointUrl.trim();
+        if (editS3Prefix.trim()) creds.prefix = editS3Prefix.trim();
         if (Object.keys(creds).length) body.credentials = creds;
       } else if (profile.type === 'azure_blob') {
         const creds: Record<string, unknown> = {};
         if (editAzureBlobContainer.trim()) creds.container = editAzureBlobContainer.trim();
         if (editAzureBlobAccountName.trim()) creds.azure_storage_account_name = editAzureBlobAccountName.trim();
         if (editAzureBlobAccountKey) creds.azure_storage_account_key = editAzureBlobAccountKey;
+        if (editAzureBlobPrefix.trim()) creds.prefix = editAzureBlobPrefix.trim();
         if (Object.keys(creds).length) body.credentials = creds;
       } else if (profile.type === 'bigquery') {
         const creds: Record<string, unknown> = {};
@@ -927,6 +952,8 @@ export default function ConnectionProfiles({
                 className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
               <input required type="password" value={snowflakePassword} onChange={(e) => setSnowflakePassword(e.target.value)} placeholder="Password"
                 className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+              <input value={snowflakeSchema} onChange={(e) => setSnowflakeSchema(e.target.value)} placeholder="Schema (default: PUBLIC)"
+                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
               <input value={snowflakeWarehouse} onChange={(e) => setSnowflakeWarehouse(e.target.value)} placeholder="Warehouse (optional)"
                 className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
               <input value={snowflakeRole} onChange={(e) => setSnowflakeRole(e.target.value)} placeholder="Role (optional)"
@@ -944,6 +971,8 @@ export default function ConnectionProfiles({
                 className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
               <input value={s3EndpointUrl} onChange={(e) => setS3EndpointUrl(e.target.value)} placeholder="Endpoint URL (for MinIO or other S3-compatible services)"
                 className="md:col-span-2 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+              <input value={s3Prefix} onChange={(e) => setS3Prefix(e.target.value)} placeholder="Prefix (optional - only read objects under this folder, e.g. exports/2026/)"
+                className="md:col-span-2 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
             </>
           ) : sourceType === 'azure_blob' ? (
             <>
@@ -953,6 +982,8 @@ export default function ConnectionProfiles({
                 className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
               <input required type="password" value={azureBlobAccountKey} onChange={(e) => setAzureBlobAccountKey(e.target.value)} placeholder="Storage account key"
                 className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+              <input value={azureBlobPrefix} onChange={(e) => setAzureBlobPrefix(e.target.value)} placeholder="Prefix (optional - only read blobs under this folder, e.g. exports/2026/)"
+                className="md:col-span-2 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
             </>
           ) : sourceType === 'bigquery' ? (
             <>
@@ -1293,16 +1324,20 @@ export default function ConnectionProfiles({
                     )}
                   </div>
                   <p className="mt-0.5 truncate text-[11px] text-slate-500">
-                    {profile.last_introspected_at
+                    {DESTINATION_ONLY_TYPES.has(profile.type)
+                      ? 'Destination-only - used to write pipeline output, not read as a source. No introspection needed.'
+                      : profile.last_introspected_at
                       ? `Last introspected ${new Date(profile.last_introspected_at).toLocaleString()}`
                       : 'Not introspected yet - required before it can be used to generate a pipeline.'}
                   </p>
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
+                  {!DESTINATION_ONLY_TYPES.has(profile.type) && (
                   <button onClick={() => introspect(profile.id)} disabled={busyId === profile.id}
                     className="rounded-lg border border-cyan-800 px-2.5 py-1.5 text-[11px] font-semibold text-cyan-300 hover:bg-cyan-950 disabled:opacity-50">
                     {profile.last_introspected_at ? 'Re-introspect' : 'Introspect'}
                   </button>
+                  )}
                   {/* File profiles have no editable credentials dict at all
                       - their real data is uploaded files, a different
                       operation entirely - so no Edit button for them. */}
@@ -1373,6 +1408,8 @@ export default function ConnectionProfiles({
                         className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
                       <input type="password" value={editSnowflakePassword} onChange={(e) => setEditSnowflakePassword(e.target.value)} placeholder="New password (optional)"
                         className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+                      <input value={editSnowflakeSchema} onChange={(e) => setEditSnowflakeSchema(e.target.value)} placeholder="New schema (optional)"
+                        className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
                       <input value={editSnowflakeWarehouse} onChange={(e) => setEditSnowflakeWarehouse(e.target.value)} placeholder="New warehouse (optional)"
                         className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
                       <input value={editSnowflakeRole} onChange={(e) => setEditSnowflakeRole(e.target.value)} placeholder="New role (optional)"
@@ -1390,6 +1427,8 @@ export default function ConnectionProfiles({
                         className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
                       <input value={editS3EndpointUrl} onChange={(e) => setEditS3EndpointUrl(e.target.value)} placeholder="New endpoint URL (optional)"
                         className="md:col-span-2 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+                      <input value={editS3Prefix} onChange={(e) => setEditS3Prefix(e.target.value)} placeholder="New prefix (optional)"
+                        className="md:col-span-2 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
                     </div>
                   ) : profile.type === 'azure_blob' ? (
                     <div className="grid gap-2 md:grid-cols-3">
@@ -1399,6 +1438,8 @@ export default function ConnectionProfiles({
                         className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
                       <input type="password" value={editAzureBlobAccountKey} onChange={(e) => setEditAzureBlobAccountKey(e.target.value)} placeholder="New account key (optional)"
                         className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
+                      <input value={editAzureBlobPrefix} onChange={(e) => setEditAzureBlobPrefix(e.target.value)} placeholder="New prefix (optional)"
+                        className="md:col-span-2 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none" />
                     </div>
                   ) : profile.type === 'bigquery' ? (
                     <div className="space-y-2">

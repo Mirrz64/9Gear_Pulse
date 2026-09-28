@@ -6,6 +6,8 @@ python-multipart>=0.0.32
 # Database & ORM
 SQLAlchemy>=2.0.51
 psycopg2-binary>=2.9.12
+pymssql>=2.4.0  # Azure SQL source introspection - runs here in the backend/worker process, not the sandbox (which gets its own copy for destination-side pipeline execution)
+snowflake-sqlalchemy>=1.11.0  # Snowflake source introspection - floor is the fix for CVE-2026-15736 (SQL injection + arbitrary local file read in versions <1.11.0), not just an arbitrary minimum
 alembic>=1.13.0
 
 # AI / LLM Providers
@@ -17,6 +19,8 @@ dlt>=1.29.1
 docker>=7.2.0
 sqlglot>=30.16.0
 PyYAML>=6.0  # validates generated docker-compose.yml scaffold content
+boto3>=1.43.0  # S3/MinIO source introspection - listing and sampling bucket objects, runs in the backend/worker process (the sandbox's own dlt[filesystem] handles destination-side pipeline execution separately)
+azure-storage-blob>=12.19.0  # Azure Blob source introspection - listing/sampling container blobs in the backend/worker process (the sandbox's own dlt[az] handles pipeline-side reads and writes separately)
 
 # Scheduling & Environment
 apscheduler>=3.11.3
